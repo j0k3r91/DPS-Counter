@@ -741,14 +741,29 @@ static void ParseEnter(const unsigned char* p, unsigned int sz)
                         _snprintf_s(g_combat[ci].name, sizeof(g_combat[ci].name), _TRUNCATE, "%s", e->name);
                 StatsCS_Leave();
             }
-            if (isFirstEnter && g_localHandle == 0)
+            if (isFirstEnter)
             {
-                g_localHandle = handle;
-                // S'assurer que g_localNameCache est aussi renseigne
-                if (!g_localNameCache[0] && e && e->name[0])
-                    _snprintf_s(g_localNameCache, sizeof(g_localNameCache), _TRUNCATE, "%s", e->name);
+                // isFirstEnter est vrai uniquement pour le personnage local qui entre en jeu.
+                // On met TOUJOURS a jour l'identite locale, meme si g_localHandle etait deja connu
+                // (gere le cas changement de personnage sans relancer l'EXE).
+                if (g_localHandle != handle)
+                {
+                    Log("CharacterChange: ancien h=%u -> nouveau h=%u name=[%s]",
+                        g_localHandle, handle, (e && e->name[0]) ? e->name : "?");
+                    g_localHandle       = handle;
+                    g_localNameCache[0] = '\0';
+                    if (e && e->name[0])
+                        _snprintf_s(g_localNameCache, sizeof(g_localNameCache), _TRUNCATE, "%s", e->name);
+                    ResetCombat(); // nouveau personnage = nouveau combat
+                }
+                else if (g_localHandle == 0)
+                {
+                    g_localHandle = handle;
+                    if (!g_localNameCache[0] && e && e->name[0])
+                        _snprintf_s(g_localNameCache, sizeof(g_localNameCache), _TRUNCATE, "%s", e->name);
+                }
             }
-            // Detecter le local par nom si g_localNameCache est connu
+            // Detecter le local par nom si g_localNameCache est connu et handle pas encore defini
             if (g_localHandle == 0 && g_localNameCache[0] && e && e->name[0] &&
                 strncmp(e->name, g_localNameCache, LOCAL_NAME_LEN) == 0)
             {
