@@ -402,7 +402,9 @@ static void GetEntityName(unsigned int h, char* out, int outLen)
     EntityInfo* e = FindEntity(h);
     if (e && e->name[0])
         _snprintf_s(out, outLen, outLen-1, "%s", e->name);
-    else if (h == g_localHandle && g_localNameCache[0])
+    // Fallback localNameCache UNIQUEMENT si le nom vient d'un packet reseau (fiable).
+    // Si le nom vient du scan heap seulement, on affiche #handle plutot qu'un nom incorrect.
+    else if (h == g_localHandle && g_localNameCache[0] && g_localNameFromPacket)
         _snprintf_s(out, outLen, outLen-1, "%s", g_localNameCache);
     else
         _snprintf_s(out, outLen, outLen-1, "#%u", h);
@@ -1088,7 +1090,9 @@ static void ParseOpcode1000(const unsigned char* p, unsigned int sz)
         if (IsPlayerEntity(h) && g_localHandle == 0) {
             g_localHandle = h;
             Log("OPC1000: g_localHandle <- %u (0x%08X)", h, h);
-            if (!g_localNameCache[0])
+            // Sur V7, ne pas lancer le scan heap : il trouve souvent un mauvais nom
+            // (ancien personnage encore en cache memoire). Le nom viendra de ParseEnter.
+            if (!g_clientV7 && !g_localNameCache[0])
                 CloseHandle(CreateThread(nullptr, 0, ScanNameByHandleThread, (LPVOID)(uintptr_t)h, 0, nullptr));
         }
     }
@@ -1923,10 +1927,12 @@ static void DrawDPSPanel(IDirect3DDevice9* dev)
     float topDps      = (topDmg > 0) ? (float)(topDmg / effSec) : 0.f;
     StatsCS_Leave();
 
-    // Retry scan name si nom local toujours inconnu (toutes les 5s)
+    // Retry scan name si nom local toujours inconnu (toutes les 5s).
+    // Desactive sur V7 : le scan heap trouve souvent un mauvais nom (ancien perso en cache).
+    // Le nom viendra de ParseEnter au prochain changement de zone.
     {
         static DWORD s_lastScanRetry = 0;
-        if (g_localHandle && !g_localNameCache[0] && now - s_lastScanRetry > 5000) {
+        if (!g_clientV7 && g_localHandle && !g_localNameCache[0] && now - s_lastScanRetry > 5000) {
             s_lastScanRetry = now;
             CloseHandle(CreateThread(nullptr, 0, ScanNameByHandleThread,
                                      (LPVOID)(uintptr_t)(unsigned int)g_localHandle, 0, nullptr));
