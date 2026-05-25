@@ -645,16 +645,11 @@ static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg)
         if (!VirtualQuery(addr, &mbi, sizeof(mbi)) || mbi.RegionSize == 0) break;
 
         bool regionOk = (mbi.State == MEM_COMMIT) &&
+                        (mbi.Type == MEM_PRIVATE) &&
                         !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
                         (mbi.Protect & (PAGE_EXECUTE_READ | PAGE_READONLY |
                                         PAGE_READWRITE | PAGE_WRITECOPY |
                                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
-        // Sur V7 (fenetre serree) on accepte aussi MEM_MAPPED — la struct joueur peut
-        // ne pas etre dans le heap prive. Sur l'ancien client on garde MEM_PRIVATE.
-        if (tightScan)
-            regionOk = regionOk && (mbi.Type == MEM_PRIVATE || mbi.Type == MEM_MAPPED);
-        else
-            regionOk = regionOk && (mbi.Type == MEM_PRIVATE);
 
         if (regionOk)
         {
@@ -668,31 +663,24 @@ static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg)
 
                     if (tightScan)
                     {
-                        // V7 : fenetre restreinte, offsets +4 a +24 apres le handle.
-                        // On garde la restriction offset positif uniquement pour eviter
-                        // les faux positifs (Erzate, etc. ne peuvent pas etre a +4..+24
-                        // d'un handle qui n'est pas le leur).
-                        for (SIZE_T delta = 4; delta <= 24; ++delta)
-                        {
-                            SIZE_T n = off + delta;
-                            if (n >= s) break;
-                            // Doit commencer par une majuscule
-                            if (!(b[n] >= 'A' && b[n] <= 'Z')) continue;
-                            // Le byte precedent ne doit pas etre un alphanum (debut de string)
-                            if (delta > 4 && n > 0 && isNameChar(b[n - 1])) continue;
-                            int len = 0;
-                            while (len < 20 && n + (SIZE_T)len < s && isNameChar(b[n + len])) ++len;
-                            if (len < 2 || len > 20) continue;
-                            // Null-termine OU fin de page (guard de securite)
-                            if (n + (SIZE_T)len < s && b[n + len] != 0) continue;
-                            char cand[24] = {};
-                            memcpy(cand, b + n, len);
-                            bool found = false;
-                            for (int k = 0; k < nCands; ++k)
-                                if (strcmp(cands[k].name, cand) == 0) { cands[k].count++; found=true; break; }
-                            if (!found && nCands < 64)
-                                { memcpy(cands[nCands].name,cand,len+1); cands[nCands].count=1; nCands++; }
-                        }
+                        // V7 : offset STRICTEMENT +4, confirme par CE.
+                        // Layout memoire : [handle(4)][name(<=20)][nul].
+                        // Ne PAS elargir : delta 5..24 genere des faux positifs (Erzate
+                        // peut apparaitre a d'autres offsets dans des structs non-joueur).
+                        SIZE_T n = off + 4;
+                        if (n >= s) continue;
+                        if (!(b[n] >= 'A' && b[n] <= 'Z')) continue;
+                        int len = 0;
+                        while (len < 20 && n + (SIZE_T)len < s && isNameChar(b[n + len])) ++len;
+                        if (len < 2 || len > 20) continue;
+                        if (n + (SIZE_T)len >= s || b[n + len] != 0) continue;
+                        char cand[24] = {};
+                        memcpy(cand, b + n, len);
+                        bool found = false;
+                        for (int k = 0; k < nCands; ++k)
+                            if (strcmp(cands[k].name, cand) == 0) { cands[k].count++; found=true; break; }
+                        if (!found && nCands < 64)
+                            { memcpy(cands[nCands].name,cand,len+1); cands[nCands].count=1; nCands++; }
                     }
                     else
                     {
@@ -731,6 +719,13 @@ static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg)
     for (int k = 0; k < nCands; ++k)
         if (!best || cands[k].count > best->count) best = &cands[k];
 
+    // Log TOUS les candidats pour le diagnostic
+    Log("ScanNameByHandle: h=0x%08X nCands=%d scanned=%lldMB tight=%d",
+        localH, nCands, scanned >> 20, (int)tightScan);
+    for (int k = 0; k < nCands; ++k)
+        Log("  cand[%d]: [%s] count=%d%s", k, cands[k].name, cands[k].count,
+            (best == &cands[k]) ? " <-- WINNER" : "");
+
     if (best && best->count >= 1 && !(g_localNameCache[0] && g_localNameFromPacket))
     {
         _snprintf_s(g_localNameCache, sizeof(g_localNameCache), _TRUNCATE, "%s", best->name);
@@ -744,8 +739,7 @@ static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg)
             if (g_combat[ci].handle == localH)
                 _snprintf_s(g_combat[ci].name, sizeof(g_combat[ci].name), _TRUNCATE, "%s", best->name);
         StatsCS_Leave();
-        Log("ScanNameByHandle: h=0x%08X -> name=[%s] count=%d/%d cands (tight=%d)",
-            localH, best->name, best->count, nCands, (int)tightScan);
+        Log("ScanNameByHandle: -> using [%s] count=%d", best->name, best->count);
     }
     else
         Log("ScanNameByHandle: aucun nom pour h=0x%08X nCands=%d", localH, nCands);
