@@ -154,6 +154,9 @@ static bool g_clientV7 = false;
 // Declarations avancees (defini plus bas dans le fichier)
 static HMODULE g_hMod = nullptr;  // initialise dans DllMain
 static int     g_scrollOffset = 0;
+// Vrai si localNameCache a ete renseigne depuis un packet reseau (source autoritaire).
+// Empeche le scan heap d'ecraser un nom deja correct.
+static bool    g_localNameFromPacket = false;
 
 static int SkillResultSize(unsigned char t)
 {
@@ -607,7 +610,8 @@ static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg)
     unsigned int localH = (unsigned int)(uintptr_t)pArg;
     if (!localH) return 0;
     Sleep(1000);
-    if (g_localNameCache[0]) return 0;
+    // Ne pas ecraser un nom deja fourni par un packet reseau (source autoritaire)
+    if (g_localNameCache[0] && g_localNameFromPacket) return 0;
 
     BYTE hBytes[4];
     memcpy(hBytes, &localH, 4);
@@ -753,17 +757,24 @@ static void ParseEnter(const unsigned char* p, unsigned int sz)
                 {
                     Log("CharacterChange: ancien h=%u -> nouveau h=%u name=[%s]",
                         g_localHandle, handle, (e && e->name[0]) ? e->name : "?");
-                    g_localHandle       = handle;
-                    g_localNameCache[0] = '\0';
+                    g_localHandle        = handle;
+                    g_localNameCache[0]  = '\0';
+                    g_localNameFromPacket = false;
                     if (e && e->name[0])
+                    {
                         _snprintf_s(g_localNameCache, sizeof(g_localNameCache), _TRUNCATE, "%s", e->name);
+                        g_localNameFromPacket = true;
+                    }
                     ResetCombat(); // nouveau personnage = nouveau combat
                 }
                 else if (g_localHandle == 0)
                 {
                     g_localHandle = handle;
                     if (!g_localNameCache[0] && e && e->name[0])
+                    {
                         _snprintf_s(g_localNameCache, sizeof(g_localNameCache), _TRUNCATE, "%s", e->name);
+                        g_localNameFromPacket = true;
+                    }
                 }
             }
             // Detecter le local par nom si g_localNameCache est connu et handle pas encore defini
@@ -773,11 +784,16 @@ static void ParseEnter(const unsigned char* p, unsigned int sz)
                 g_localHandle = handle;
                 Log("LocalPlayer detected via ParseEnter name-match: h=%u", handle);
             }
-            // Si on avait deja ce handle (via OPC1000 ou autre), mettre a jour le nom cache
+            // Si on avait deja ce handle (via OPC1000 ou autre), mettre a jour le nom cache.
+            // On ecrase TOUJOURS : le packet reseau est plus fiable que le scan heap.
             else if (g_localHandle == handle) {
-                if (!g_localNameCache[0] && e && e->name[0]) {
+                if (e && e->name[0]) {
+                    if (!g_localNameCache[0])
+                        Log("ParseEnter: localNameCache late-set=[%s]", e->name);
+                    else if (strcmp(g_localNameCache, e->name) != 0)
+                        Log("ParseEnter: localNameCache corrige [%s] -> [%s]", g_localNameCache, e->name);
                     _snprintf_s(g_localNameCache, sizeof(g_localNameCache), _TRUNCATE, "%s", e->name);
-                    Log("ParseEnter: localNameCache late-set=[%s]", g_localNameCache);
+                    g_localNameFromPacket = true;
                 }
             }
         }
@@ -1101,8 +1117,9 @@ static void DispatchPacket(const unsigned char* p, unsigned int sz)
             // on remet g_localHandle a 0 pour que le prochain ENTER le detecte a nouveau.
             if (h == g_localHandle) {
                 Log("LocalPlayer LEAVE h=%u -> reset localHandle", h);
-                g_localHandle       = 0;
-                g_localNameCache[0] = '\0';
+                g_localHandle        = 0;
+                g_localNameCache[0]  = '\0';
+                g_localNameFromPacket = false;
             }
         }
         break;
