@@ -611,6 +611,9 @@ static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg)
 {
     unsigned int localH = (unsigned int)(uintptr_t)pArg;
     if (!localH) return 0;
+    // Sur V7 le scan heap trouve systematiquement un mauvais nom (ancien perso en cache).
+    // Desactive entierement : le nom viendra de ParseEnter au prochain changement de zone.
+    if (g_clientV7) return 0;
     Sleep(1000);
     // Ne pas ecraser un nom deja fourni par un packet reseau (source autoritaire)
     if (g_localNameCache[0] && g_localNameFromPacket) return 0;
@@ -843,8 +846,9 @@ static void ParseEnter(const unsigned char* p, unsigned int sz)
                         // NE PAS propager le nom du pet vers le master (ils ont des noms differents).
                         if (g_localHandle == 0)
                             g_localHandle = master;
-                        // Si le nom du local player est toujours inconnu, scanner la memoire
-                        if (g_localHandle == master && !g_localNameCache[0]) {
+                        // Sur V7, ne pas lancer le scan heap : trouve souvent un mauvais nom
+                        // (ancien perso en cache memoire). Le nom viendra de ParseEnter.
+                        if (!g_clientV7 && g_localHandle == master && !g_localNameCache[0]) {
                             Log("LocalPlayer from summon: h=0x%08X (scanning for name)", master);
                             CloseHandle(CreateThread(nullptr, 0, ScanNameByHandleThread,
                                                      (LPVOID)(uintptr_t)master, 0, nullptr));
