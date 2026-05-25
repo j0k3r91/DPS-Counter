@@ -45,6 +45,29 @@ Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/).
 
 ---
 
+## [1.1.0] — 2026-05-25
+
+### Ajouté
+- **Hook réseau V7** : nouveau pattern `NET_HOOK_PATTERN_V7` (12 octets) hookant  
+  `movzx ecx,[edi+04]` (RVA `0x21E5D8`). Callback `V7PacketCallback` appelle  
+  `DispatchPacket` directement (pas de réassemblage stream, packet déjà complet dans `edi`).  
+  `InstallNetworkHook` tente d'abord l'ancien pattern, puis le pattern V7 si `g_clientV7`.  
+  `RemoveNetworkHook` restaure les bytes corrects selon `g_netHook.isV7`.
+- **Onglet "Max"** (4ème tab `TAB_MAXHIT`) : affiche le plus grand coup sorti / soin /  
+  dégât reçu (valeur brute, sans division par le temps).
+- **Persistence position du panneau** : la position est sauvegardée dans `dpscounter.ini`  
+  (même dossier que la DLL) après chaque déplacement et rechargée au démarrage.
+- **Défilement (scrollbar)** : molette de la souris sur le panneau scrolle la liste quand  
+  elle dépasse `MAX_ROWS` entrées. Indicateur visuel (barre bleue côté droit). Offset remis  
+  à zéro au reset combat.
+
+### Amélioré
+- **Scan heap optimisé** : limite réduite de 512 / 384 MB à **128 MB** sur les deux threads  
+  (`ScanLocalHandleThread`, `ScanNameByHandleThread`). Filtre `MEM_PRIVATE` ajouté pour  
+  ignorer les sections image/mappées et accélérer le scan.
+
+---
+
 ## [Unreleased]
 
 _(aucune modification en attente)_

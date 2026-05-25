@@ -151,6 +151,10 @@ static const unsigned char SR_CHAIN_HEAL   = 42;
 //   >= 9 000 000 bytes (~9.5 MB) --> SFrame.exe ancien client (17 types elementaux)
 static bool g_clientV7 = false;
 
+// Declarations avancees (defini plus bas dans le fichier)
+static HMODULE g_hMod = nullptr;  // initialise dans DllMain
+static int     g_scrollOffset = 0;
+
 static int SkillResultSize(unsigned char t)
 {
     // DamageType = 1+4+4+1+4+4 + N*2 bytes (N = nombre de types elementaux)
@@ -280,7 +284,7 @@ static DWORD WINAPI ScanLocalHandleThread(LPVOID)
 
     BYTE* addr = (BYTE*)0x10000;
     LONGLONG scanned = 0;
-    const LONGLONG SCAN_LIMIT = 512LL * 1024 * 1024;
+    const LONGLONG SCAN_LIMIT = 128LL * 1024 * 1024; // reduit : heap privee ~64-128 MB suffit
 
     Log("ScanHandle: start namePtr=0x%08X name=[%s]", staticNamePtr, g_localNameCache);
 
@@ -290,8 +294,9 @@ static DWORD WINAPI ScanLocalHandleThread(LPVOID)
         MEMORY_BASIC_INFORMATION mbi = {};
         if (!VirtualQuery(addr, &mbi, sizeof(mbi)) || mbi.RegionSize == 0) break;
 
-        // Scanne uniquement les pages read/write committees (heap, stacks, mapped r/w)
+        // Scanne uniquement les pages read/write privees commitees (heap, stacks)
         if (mbi.State == MEM_COMMIT &&
+            mbi.Type  == MEM_PRIVATE &&
             !(mbi.Protect & (PAGE_GUARD|PAGE_NOACCESS)) &&
             (mbi.Protect & (PAGE_READWRITE|PAGE_WRITECOPY|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY)))
         {
@@ -487,7 +492,7 @@ static void StatsCS_Init()  { InitializeCriticalSection(&g_statsCS); }
 static void StatsCS_Enter() { EnterCriticalSection(&g_statsCS); }
 static void StatsCS_Leave() { LeaveCriticalSection(&g_statsCS); }
 
-enum MetricTab { TAB_DPS = 0, TAB_HEAL = 1, TAB_RCVD = 2 };
+enum MetricTab { TAB_DPS = 0, TAB_HEAL = 1, TAB_RCVD = 2, TAB_MAXHIT = 3 };
 static MetricTab g_tab = TAB_DPS;
 
 static CombatEntry* FindOrCreateCombat(unsigned int h)
@@ -523,6 +528,7 @@ static void ResetCombat()
     memset(g_combat, 0, sizeof(CombatEntry) * g_combatCount);
     g_combatCount = 0;
     g_fightStart = g_fightEnd = g_lastHit = 0;
+    g_scrollOffset = 0;
     StatsCS_Leave();
 }
 static void OnCombatEvent()
@@ -616,7 +622,7 @@ static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg)
     NC cands[64] = {}; int nCands = 0;
 
     BYTE* addr = (BYTE*)0x10000;
-    const LONGLONG SCAN_LIMIT = 384LL * 1024 * 1024;
+    const LONGLONG SCAN_LIMIT = 128LL * 1024 * 1024; // reduit : heap privee ~64-128 MB suffit
     LONGLONG scanned = 0;
 
     while (addr < (BYTE*)0x7FF00000 && scanned < SCAN_LIMIT)
@@ -626,6 +632,7 @@ static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg)
         if (!VirtualQuery(addr, &mbi, sizeof(mbi)) || mbi.RegionSize == 0) break;
 
         if (mbi.State == MEM_COMMIT &&
+            mbi.Type  == MEM_PRIVATE &&
             !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
             (mbi.Protect & (PAGE_EXECUTE_READ | PAGE_READONLY |
                             PAGE_READWRITE | PAGE_WRITECOPY |
@@ -1275,89 +1282,181 @@ static const unsigned char NET_HOOK_PATTERN[] = {
 };
 static const int NET_HOOK_OFFSET = 6; // on JMP au 7e byte (51 8B CE FF D2)
 
-struct JmpHook { void* pSite; void* pStub; bool installed; };
+// V7 (Sframe.exe ~8.9 MB) : hook au moment de la lecture du packet ID
+//   edi = TS_MESSAGE* (packet complet, valide)
+//   [edi+0] = uint32 size, [edi+4] = uint16 id
+//
+// Pattern : cmp [edi],eax; ja erreur; movzx ecx,[edi+4]
+// Hook site = offset 8 (sur movzx ecx,[edi+4])
+// Bytes voles (6) : 0F B7 4F 04  (movzx ecx,[edi+4])
+//                   8B C1         (mov eax,ecx)
+// Orphan byte a hookSite+5 : 0xC1 (partie de mov eax,ecx, jamais atteint)
+// JMP retour -> hookSite+6
+static const unsigned char NET_HOOK_PATTERN_V7[] = {
+    0x39, 0x07,                           // cmp [edi],eax
+    0x0F, 0x87, 0xC4, 0x08, 0x00, 0x00,  // ja +0x8C4 (vers handler erreur)
+    0x0F, 0xB7, 0x4F, 0x04               // movzx ecx,word ptr [edi+04]  <- hook ici
+};
+static const int NET_HOOK_OFFSET_V7 = 8; // offset du pattern vers le hook site
+
+struct JmpHook { void* pSite; void* pStub; bool installed; bool isV7; };
 static JmpHook g_netHook = {};
+
+// Callback V7 : appele depuis le stub avec edi = TS_MESSAGE*.
+// Le packet est complet et valide (taille verifiee par le client).
+extern "C" void __cdecl V7PacketCallback(const unsigned char* pkt)
+{
+    if (!pkt) return;
+    unsigned int sz = ReadU32(pkt);
+    if (sz < 7 || sz > 65536) return;
+    InterlockedIncrement(&g_debugBufCalls);
+    EnterCriticalSection(&g_streamCS);
+    DispatchPacket(pkt, sz);
+    LeaveCriticalSection(&g_streamCS);
+}
 
 static bool InstallNetworkHook()
 {
+    // --- Tentative 1 : ancien client (SFrame.exe 17-elem) ---
     void* patAddr = ScanPattern(NET_HOOK_PATTERN, sizeof(NET_HOOK_PATTERN));
-    if (!patAddr) { Log("NET_HOOK_PATTERN introuvable"); return false; }
+    if (patAddr)
+    {
+        BYTE* hookSite = (BYTE*)patAddr + NET_HOOK_OFFSET;
+        Log("Pattern ancien client @ %p, hookSite @ %p", patAddr, hookSite);
 
-    BYTE* hookSite = (BYTE*)patAddr + NET_HOOK_OFFSET;
-    Log("Pattern @ %p, hookSite @ %p", patAddr, hookSite);
+        BYTE* stub = (BYTE*)VirtualAlloc(nullptr, 128,
+                         MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!stub) { Log("VirtualAlloc stub FAIL err=%lu", GetLastError()); return false; }
+
+        // --------------------------------------------------------
+        // Stub ancien client
+        // Entree via JMP : ecx=buf, [esp+0]=size, esi=disp, edx=OnRecv
+        // --------------------------------------------------------
+        BYTE* s = stub;
+
+        *s++ = 0x50;  // push eax
+        *s++ = 0x51;  // push ecx  (buf_ptr)
+        *s++ = 0x52;  // push edx  (OnRecv fn)
+        *s++ = 0x56;  // push esi  (dispatcher)
+        // [esp]=esi [esp+4]=edx [esp+8]=buf [esp+12]=eax [esp+16]=size
+
+        *s++ = 0xFF; *s++ = 0x74; *s++ = 0x24; *s++ = 0x10; // push size [esp+16]
+        *s++ = 0xFF; *s++ = 0x74; *s++ = 0x24; *s++ = 0x0C; // push buf  [esp+12]
+
+        DWORD callTarget = (DWORD)(uintptr_t)ProcessDecryptedBuffer;
+        DWORD callFrom   = (DWORD)(uintptr_t)(s + 5);
+        *s++ = 0xE8;
+        *(DWORD*)s = callTarget - callFrom;
+        s += 4;
+
+        *s++ = 0x83; *s++ = 0xC4; *s++ = 0x08; // add esp,8
+        *s++ = 0x5E; // pop esi
+        *s++ = 0x5A; // pop edx
+        *s++ = 0x59; // pop ecx
+        *s++ = 0x58; // pop eax
+
+        // Bytes voles : 51 8B CE FF D2
+        *s++ = 0x51;               // push ecx
+        *s++ = 0x8B; *s++ = 0xCE; // mov ecx, esi
+        *s++ = 0xFF; *s++ = 0xD2; // call edx
+
+        // JMP vers hookSite+5
+        BYTE* jmpBack = hookSite + 5;
+        DWORD jmpRel  = (DWORD)(uintptr_t)jmpBack - (DWORD)(uintptr_t)(s + 5);
+        *s++ = 0xE9;
+        *(DWORD*)s = jmpRel;
+        s += 4;
+
+        Log("Stub ancien %d bytes @ %p", (int)(s - stub), stub);
+
+        DWORD old = 0;
+        if (!VirtualProtect(hookSite, 5, PAGE_EXECUTE_READWRITE, &old)) {
+            Log("VirtualProtect FAIL err=%lu", GetLastError());
+            VirtualFree(stub, 0, MEM_RELEASE);
+            return false;
+        }
+        DWORD rel = (DWORD)(uintptr_t)stub - (DWORD)(uintptr_t)(hookSite + 5);
+        hookSite[0] = 0xE9;
+        *(DWORD*)(hookSite + 1) = rel;
+        FlushInstructionCache(GetCurrentProcess(), hookSite, 5);
+        VirtualProtect(hookSite, 5, old, &old);
+
+        g_netHook.pSite     = hookSite;
+        g_netHook.pStub     = stub;
+        g_netHook.installed = true;
+        g_netHook.isV7      = false;
+        Log("Hook reseau (ancien) OK : site=%p stub=%p", hookSite, stub);
+        return true;
+    }
+
+    // --- Tentative 2 : nouveau client V7 (Sframe.exe 7-elem) ---
+    if (!g_clientV7)
+    {
+        Log("NET_HOOK_PATTERN introuvable et client non-V7 : hook impossible");
+        return false;
+    }
+
+    patAddr = ScanPattern(NET_HOOK_PATTERN_V7, sizeof(NET_HOOK_PATTERN_V7));
+    if (!patAddr)
+    {
+        Log("NET_HOOK_PATTERN_V7 introuvable");
+        return false;
+    }
+
+    BYTE* hookSite = (BYTE*)patAddr + NET_HOOK_OFFSET_V7;
+    Log("Pattern V7 @ %p, hookSite @ %p", patAddr, hookSite);
 
     BYTE* stub = (BYTE*)VirtualAlloc(nullptr, 128,
                      MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!stub) { Log("VirtualAlloc stub FAIL err=%lu", GetLastError()); return false; }
+    if (!stub) { Log("VirtualAlloc stub V7 FAIL err=%lu", GetLastError()); return false; }
 
     // --------------------------------------------------------
-    // Ecriture du stub
-    // Entree via JMP : ecx=buf, [esp+0]=size, esi=disp, edx=OnRecv
-    //
-    // Apres push eax/ecx/edx/esi :
-    //  [esp+ 0]=esi [esp+ 4]=edx [esp+ 8]=ecx/buf
-    //  [esp+12]=eax [esp+16]=size
-    //
-    // Appel cdecl ProcessDecryptedBuffer(buf, size) :
-    //  args R-to-L : push size([esp+16]) puis push buf([esp+12 apres le push])
-    //
-    // Puis restore, bytes voles, JMP retour
+    // Stub V7
+    // Entree via JMP : edi = TS_MESSAGE* (packet complet, valide)
+    // On appelle V7PacketCallback(edi) en cdecl puis on restaure eax,ecx,edx,esi.
+    // edi doit rester intact (utilise apres le retour).
+    // Bytes voles (6) : 0F B7 4F 04 (movzx ecx,[edi+4]) + 8B C1 (mov eax,ecx)
+    // Orphan byte a hookSite+5 = 0xC1 (jamais execute)
+    // JMP retour -> hookSite+6
     // --------------------------------------------------------
     BYTE* s = stub;
 
-    *s++ = 0x50;  // push eax
-    *s++ = 0x51;  // push ecx  (buf_ptr)
-    *s++ = 0x52;  // push edx  (OnRecv fn)
-    *s++ = 0x56;  // push esi  (dispatcher)
-    // [esp]=esi [esp+4]=edx [esp+8]=buf [esp+12]=eax [esp+16]=size
+    *s++ = 0x50; // push eax
+    *s++ = 0x51; // push ecx
+    *s++ = 0x52; // push edx
+    *s++ = 0x56; // push esi
 
-    // push size  = [esp+16]
-    *s++ = 0xFF; *s++ = 0x74; *s++ = 0x24; *s++ = 0x10;
-    // [esp]=size [esp+4]=esi [esp+8]=edx [esp+12]=buf [esp+16]=eax [esp+20]=size_orig
+    *s++ = 0x57; // push edi   <- arg : TS_MESSAGE*
+    {
+        DWORD ct = (DWORD)(uintptr_t)V7PacketCallback;
+        DWORD cf = (DWORD)(uintptr_t)(s + 5);
+        *s++ = 0xE8;
+        *(DWORD*)s = ct - cf;
+        s += 4;
+    }
+    *s++ = 0x83; *s++ = 0xC4; *s++ = 0x04; // add esp,4  (cleanup 1 arg)
 
-    // push buf_ptr = [esp+12]  (buf etait a [esp+8], decale a [esp+12] apres push size)
-    *s++ = 0xFF; *s++ = 0x74; *s++ = 0x24; *s++ = 0x0C;
-    // [esp]=buf [esp+4]=size -> ProcessDecryptedBuffer(buf, size)
+    *s++ = 0x5E; // pop esi
+    *s++ = 0x5A; // pop edx
+    *s++ = 0x59; // pop ecx
+    *s++ = 0x58; // pop eax
 
-    // call ProcessDecryptedBuffer  (calcul offset relatif)
-    DWORD callTarget = (DWORD)(uintptr_t)ProcessDecryptedBuffer;
-    DWORD callFrom   = (DWORD)(uintptr_t)(s + 5);
-    *s++ = 0xE8;
-    *(DWORD*)s = callTarget - callFrom;
-    s += 4;
+    // Bytes voles (instructions completes) :
+    *s++ = 0x0F; *s++ = 0xB7; *s++ = 0x4F; *s++ = 0x04; // movzx ecx,[edi+4]
+    *s++ = 0x8B; *s++ = 0xC1;                             // mov eax,ecx
 
-    // add esp, 8  (cleanup 2 args cdecl)
-    *s++ = 0x83; *s++ = 0xC4; *s++ = 0x08;
-
-    // pop esi, edx, ecx (buf), eax
-    *s++ = 0x5E;  // pop esi
-    *s++ = 0x5A;  // pop edx
-    *s++ = 0x59;  // pop ecx  (buf_ptr restaure)
-    *s++ = 0x58;  // pop eax
-    // Stack : [esp+0]=size  (meme etat qu'a l'entree du stub)
-
-    // ---- Bytes voles : 51 8B CE FF D2 ----
-    // push ecx  -> stack=[buf_ptr][size]
-    // mov ecx,esi -> ecx=dispatcher
-    // call edx  -> OnReceive(this, buf_ptr, size) ; ret 8 nettoie les 2 args
-    *s++ = 0x51;              // push ecx
-    *s++ = 0x8B; *s++ = 0xCE; // mov ecx, esi
-    *s++ = 0xFF; *s++ = 0xD2; // call edx
-    // Apres ret 8 : stack = [frame original] -> correct !
-
-    // JMP vers hookSite+5
-    BYTE* jmpBack = hookSite + 5;
+    // JMP vers hookSite+6 (saute l'orphan byte 0xC1 a hookSite+5)
+    BYTE* jmpBack = hookSite + 6;
     DWORD jmpRel  = (DWORD)(uintptr_t)jmpBack - (DWORD)(uintptr_t)(s + 5);
     *s++ = 0xE9;
     *(DWORD*)s = jmpRel;
     s += 4;
 
-    Log("Stub %d bytes @ %p", (int)(s - stub), stub);
+    Log("Stub V7 %d bytes @ %p", (int)(s - stub), stub);
 
-    // Poser le E9 JMP sur les 5 bytes a hookSite
     DWORD old = 0;
     if (!VirtualProtect(hookSite, 5, PAGE_EXECUTE_READWRITE, &old)) {
-        Log("VirtualProtect FAIL err=%lu", GetLastError());
+        Log("VirtualProtect V7 FAIL err=%lu", GetLastError());
         VirtualFree(stub, 0, MEM_RELEASE);
         return false;
     }
@@ -1370,14 +1469,23 @@ static bool InstallNetworkHook()
     g_netHook.pSite     = hookSite;
     g_netHook.pStub     = stub;
     g_netHook.installed = true;
-    Log("Hook reseau OK : site=%p stub=%p rel=0x%08X", hookSite, stub, rel);
+    g_netHook.isV7      = true;
+    Log("Hook reseau V7 OK : site=%p stub=%p", hookSite, stub);
     return true;
 }
 
 static void RemoveNetworkHook()
 {
     if (!g_netHook.installed) return;
-    static const BYTE kOrig[5] = { 0x51, 0x8B, 0xCE, 0xFF, 0xD2 };
+    BYTE kOrig[5];
+    if (g_netHook.isV7)
+    {   // movzx ecx,[edi+4] (4 bytes) + premier byte de mov eax,ecx (1 byte)
+        kOrig[0]=0x0F; kOrig[1]=0xB7; kOrig[2]=0x4F; kOrig[3]=0x04; kOrig[4]=0x8B;
+    }
+    else
+    {   // push ecx + mov ecx,esi + call edx (5 bytes)
+        kOrig[0]=0x51; kOrig[1]=0x8B; kOrig[2]=0xCE; kOrig[3]=0xFF; kOrig[4]=0xD2;
+    }
     BYTE* site = (BYTE*)g_netHook.pSite;
     DWORD old = 0;
     VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &old);
@@ -1530,7 +1638,37 @@ static bool g_panelVisible = true;
 static bool g_dragging = false, g_dragMoved = false;
 static int  g_dragOffX = 0, g_dragOffY = 0;
 static bool g_closeHover = false, g_resetHover = false;
-static bool g_tab0Hover = false, g_tab1Hover = false, g_tab2Hover = false;
+static bool g_tab0Hover = false, g_tab1Hover = false, g_tab2Hover = false, g_tab3Hover = false;
+// g_scrollOffset declare en avant de fichier
+
+// ============================================================
+// Persistence position panneau (INI)
+// ============================================================
+static void GetIniPath(char* out, int sz)
+{
+    GetModuleFileNameA(g_hMod, out, sz);
+    char* p = strrchr(out, '\\');
+    if (p) { p[1] = '\0'; strcat_s(out, sz, "dpscounter.ini"); }
+}
+static void LoadPanelPos()
+{
+    char ini[MAX_PATH] = {};
+    GetIniPath(ini, sizeof(ini));
+    int x = (int)GetPrivateProfileIntA("Panel", "X", -1, ini);
+    int y = (int)GetPrivateProfileIntA("Panel", "Y", -1, ini);
+    if (x >= 0) g_panelX = x;
+    if (y >= 0) g_panelY = y;
+    Log("LoadPanelPos: x=%d y=%d (ini=%s)", g_panelX, g_panelY, ini);
+}
+static void SavePanelPos()
+{
+    char ini[MAX_PATH] = {}; char buf[16];
+    GetIniPath(ini, sizeof(ini));
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%d", g_panelX);
+    WritePrivateProfileStringA("Panel", "X", buf, ini);
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%d", g_panelY);
+    WritePrivateProfileStringA("Panel", "Y", buf, ini);
+}
 
 static void EnsurePanelPos() {
     if (g_panelX < 0) g_panelX = 10;
@@ -1675,8 +1813,8 @@ static void DrawDPSPanel(IDirect3DDevice9* dev)
         LONGLONG total = 0; int owMax = 0; char owName[24]={};
         for (int i = 0; i < count; ++i) {
             CombatEntry* e = &g_combat[i]; if (e->ownerHandle != ow) continue;
-            LONGLONG v=(g_tab==TAB_DPS)?e->dmgOut:(g_tab==TAB_HEAL)?e->healOut:e->dmgIn;
-            int vm=(g_tab==TAB_DPS)?e->maxHit:(g_tab==TAB_HEAL)?e->maxHeal:e->maxRcvd;
+            LONGLONG v=(g_tab==TAB_DPS)?e->dmgOut:(g_tab==TAB_HEAL)?e->healOut:(g_tab==TAB_RCVD)?e->dmgIn:(LONGLONG)e->maxHit;
+            int vm=(g_tab==TAB_DPS)?e->maxHit:(g_tab==TAB_HEAL)?e->maxHeal:(g_tab==TAB_RCVD)?e->maxRcvd:e->maxHit;
             total += v;
             if (vm > owMax) owMax = vm;
             if (e->handle == ow && e->name[0]) _snprintf_s(owName,sizeof(owName),_TRUNCATE,"%s",e->name);
@@ -1690,8 +1828,8 @@ static void DrawDPSPanel(IDirect3DDevice9* dev)
         for (int i = 0; i < count && rowCount < MAX_COMBATANTS*2; ++i) {
             CombatEntry* e = &g_combat[i];
             if (e->ownerHandle!=ow || e->handle==ow) continue;
-            LONGLONG v=(g_tab==TAB_DPS)?e->dmgOut:(g_tab==TAB_HEAL)?e->healOut:e->dmgIn;
-            int vm=(g_tab==TAB_DPS)?e->maxHit:(g_tab==TAB_HEAL)?e->maxHeal:e->maxRcvd;
+            LONGLONG v=(g_tab==TAB_DPS)?e->dmgOut:(g_tab==TAB_HEAL)?e->healOut:(g_tab==TAB_RCVD)?e->dmgIn:(LONGLONG)e->maxHit;
+            int vm=(g_tab==TAB_DPS)?e->maxHit:(g_tab==TAB_HEAL)?e->maxHeal:(g_tab==TAB_RCVD)?e->maxRcvd:e->maxHit;
             if (v==0) continue;
             SortRow& rp = rows[rowCount++]; memset(&rp,0,sizeof(rp));
             rp.ownerHandle=ow; rp.selfHandle=e->handle; rp.value=v; rp.maxValue=vm; rp.isPet=true; rp.colorIdx=ci;
@@ -1765,8 +1903,12 @@ static void DrawDPSPanel(IDirect3DDevice9* dev)
                 (int)rows[ri].isPet, (int)IsPlayerEntity(rows[ri].ownerHandle));
     }
 
+    // Clamp scroll offset
+    if (g_scrollOffset < 0) g_scrollOffset = 0;
+    if (g_scrollOffset > rowCount - 1) g_scrollOffset = (rowCount > 0) ? rowCount - 1 : 0;
+
     int visRows = 0;
-    for (int i = 0; i < rowCount && i < MAX_ROWS; ++i) ++visRows;
+    for (int i = g_scrollOffset; i < rowCount && visRows < MAX_ROWS; ++i) ++visRows;
     int panelH = PANEL_HEADER + 14 + visRows*ROW_H + 4;
     int px=g_panelX, py=g_panelY, pw=PANEL_W;
 
@@ -1797,11 +1939,11 @@ static void DrawDPSPanel(IDirect3DDevice9* dev)
     {RECT rr2={rx,ry3,rx+17,ry3+18};DrawText2(g_fontSmall,"R",rr2,DT_CENTER|DT_VCENTER,D3DCOLOR_ARGB(255,150,255,150));}
 
     // Onglets
-    static const char* tl[3]={"DPS","HEAL","TANK"};
+    static const char* tl[4]={"DPS","HEAL","TANK","Max"};
     int tabW=42, tabY=py+36;
-    for (int t=0;t<3;++t){
+    for (int t=0;t<4;++t){
         int tx=px+1+t*(tabW+2); bool active=(g_tab==(MetricTab)t);
-        bool hov=(t==0?g_tab0Hover:t==1?g_tab1Hover:g_tab2Hover);
+        bool hov=(t==0?g_tab0Hover:t==1?g_tab1Hover:t==2?g_tab2Hover:g_tab3Hover);
         DWORD tbg=active?D3DCOLOR_ARGB(230,40,80,160):hov?D3DCOLOR_ARGB(200,30,60,120):D3DCOLOR_ARGB(180,20,35,70);
         FillRect2D(dev,tx,tabY,tabW,16,tbg);
         if(active)FillRect2D(dev,tx,tabY+15,tabW,1,D3DCOLOR_ARGB(255,120,180,255));
@@ -1823,7 +1965,7 @@ static void DrawDPSPanel(IDirect3DDevice9* dev)
     FillRect2D(dev,px+1,py+PANEL_HEADER-1,pw-2,1,D3DCOLOR_ARGB(120,60,120,200));
     // En-tetes de colonnes
     FillRect2D(dev,px+1,py+PANEL_HEADER,pw-2,14,D3DCOLOR_ARGB(190,10,14,24));
-    {const char* colLbl=(g_tab==TAB_HEAL)?"HPS/s":(g_tab==TAB_RCVD)?"Tank/s":"DPS/s";
+    {const char* colLbl=(g_tab==TAB_HEAL)?"HPS/s":(g_tab==TAB_RCVD)?"Tank/s":(g_tab==TAB_MAXHIT)?"Max":"DPS/s";
      RECT ch={px+pw-174,py+PANEL_HEADER,px+pw-112,py+PANEL_HEADER+14};
      DrawText2(g_fontSmall,colLbl,ch,DT_RIGHT|DT_VCENTER,D3DCOLOR_ARGB(140,150,180,220));}
     {RECT ch={px+pw-110,py+PANEL_HEADER,px+pw-46,py+PANEL_HEADER+14};
@@ -1833,7 +1975,7 @@ static void DrawDPSPanel(IDirect3DDevice9* dev)
     FillRect2D(dev,px+1,py+PANEL_HEADER+13,pw-2,1,D3DCOLOR_ARGB(80,60,120,200));
 
     int shown = 0;
-    for (int i = 0; i < rowCount && shown < MAX_ROWS; ++i, ++shown)
+    for (int i = g_scrollOffset; i < rowCount && shown < MAX_ROWS; ++i, ++shown)
     {
         SortRow& row = rows[i];
         int ry4 = py+PANEL_HEADER+14+shown*ROW_H;
@@ -1848,9 +1990,15 @@ static void DrawDPSPanel(IDirect3DDevice9* dev)
             // Nom
             {RECT nr={px+6,ry4,px+pw-176,ry4+ROW_H};
              DrawText2(g_fontRow,row.name,nr,DT_LEFT|DT_VCENTER,D3DCOLOR_ARGB(255,230,230,230));}
-            // DPS/val par seconde
+            // DPS/val par seconde (ou max hit pour l'onglet Max)
             char dpsStr[32]="--";
-            if(row.value > 0){
+            if(g_tab==TAB_MAXHIT){
+                if(row.maxValue>0){
+                    if(row.maxValue>=1000000) _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%.2fM",(float)row.maxValue/1000000.f);
+                    else if(row.maxValue>=10000) _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%.0fk",(float)row.maxValue/1000.f);
+                    else _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%d",row.maxValue);
+                }
+            } else if(row.value > 0){
                 float dps=(float)row.value / ((durationSec>1.0f)?durationSec:1.0f);
                 if(dps>=1000000.f) _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%.2fM",dps/1000000.f);
                 else if(dps>=10000.f) _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%.0fk",dps/1000.f);
@@ -1879,7 +2027,12 @@ static void DrawDPSPanel(IDirect3DDevice9* dev)
              DrawText2(g_fontSmall,row.name,nr,DT_LEFT|DT_VCENTER,D3DCOLOR_ARGB(210,180,200,140));}
             // DPS pet
             char dpsStr[32]="--";
-            if(row.value > 0){
+            if(g_tab==TAB_MAXHIT){
+                if(row.maxValue>0){
+                    if(row.maxValue>=10000) _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%.0fk",(float)row.maxValue/1000.f);
+                    else _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%d",row.maxValue);
+                }
+            } else if(row.value > 0){
                 float dps=(float)row.value / ((durationSec>1.0f)?durationSec:1.0f);
                 if(dps>=1000000.f) _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%.2fM",dps/1000000.f);
                 else if(dps>=10000.f) _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%.0fk",dps/1000.f);
@@ -1903,6 +2056,21 @@ static void DrawDPSPanel(IDirect3DDevice9* dev)
              DrawText2(g_fontSmall,ps,pr,DT_RIGHT|DT_VCENTER,D3DCOLOR_ARGB(180,210,160,60));}
         }
     }
+    // Barre de defilement verticale (visible seulement si plus de MAX_ROWS entrees)
+    if (rowCount > MAX_ROWS)
+    {
+        int sbX     = px + pw - 5;
+        int sbTrackY = py + PANEL_HEADER + 14;
+        int sbTrackH = visRows * ROW_H;
+        FillRect2D(dev, sbX, sbTrackY, 4, sbTrackH, D3DCOLOR_ARGB(100, 40, 40, 50));
+        float thumbFrac   = (float)MAX_ROWS  / (float)rowCount;
+        float offsetFrac  = (float)g_scrollOffset / (float)rowCount;
+        int   thumbH = (int)(sbTrackH * thumbFrac); if (thumbH < 6) thumbH = 6;
+        int   thumbY = sbTrackY + (int)(sbTrackH * offsetFrac);
+        if (thumbY + thumbH > sbTrackY + sbTrackH) thumbY = sbTrackY + sbTrackH - thumbH;
+        FillRect2D(dev, sbX, thumbY, 4, thumbH, D3DCOLOR_ARGB(200, 100, 150, 255));
+    }
+
     pSB->Apply(); pSB->Release();
 }
 
@@ -1934,24 +2102,35 @@ static bool PtInPanelHeader(int mx,int my){
     return mx>=g_panelX&&mx<g_panelX+PANEL_W&&my>=g_panelY&&my<g_panelY+PANEL_HEADER;}
 static bool PtInClose(int mx,int my){int bx=g_panelX+PANEL_W-18,by=g_panelY+1;return mx>=bx&&mx<bx+17&&my>=by&&my<by+18;}
 static bool PtInReset(int mx,int my){int bx=g_panelX+PANEL_W-37,by=g_panelY+1;return mx>=bx&&mx<bx+17&&my>=by&&my<by+18;}
-static int PtInTab(int mx,int my){int ty=g_panelY+36;if(my<ty||my>=ty+16)return -1;for(int t=0;t<3;++t){int tx=g_panelX+1+t*44;if(mx>=tx&&mx<tx+42)return t;}return -1;}
+static int PtInTab(int mx,int my){int ty=g_panelY+36;if(my<ty||my>=ty+16)return -1;for(int t=0;t<4;++t){int tx=g_panelX+1+t*44;if(mx>=tx&&mx<tx+42)return t;}return -1;}
 static bool HandlePanelMouse(UINT msg,LPARAM lp){
     if(!g_panelVisible||g_vpW<=0)return false;
     int mx=GET_X_LPARAM(lp),my=GET_Y_LPARAM(lp);
-    if(msg==WM_MOUSEMOVE){g_closeHover=PtInClose(mx,my);g_resetHover=PtInReset(mx,my);int t=PtInTab(mx,my);g_tab0Hover=(t==0);g_tab1Hover=(t==1);g_tab2Hover=(t==2);}
+    if(msg==WM_MOUSEMOVE){g_closeHover=PtInClose(mx,my);g_resetHover=PtInReset(mx,my);int t=PtInTab(mx,my);g_tab0Hover=(t==0);g_tab1Hover=(t==1);g_tab2Hover=(t==2);g_tab3Hover=(t==3);}
     if(msg==WM_LBUTTONDOWN&&PtInClose(mx,my)){SetCapture(g_hWnd);return true;}
     if(msg==WM_LBUTTONUP&&g_closeHover&&PtInClose(mx,my)){ReleaseCapture();g_panelVisible=false;CloseHandle(CreateThread(nullptr,0,UnloadThread,nullptr,0,nullptr));return true;}
     if(msg==WM_LBUTTONDOWN&&PtInReset(mx,my)){SetCapture(g_hWnd);return true;}
     if(msg==WM_LBUTTONUP&&g_resetHover&&PtInReset(mx,my)){ReleaseCapture();ResetCombat();return true;}
-    if(msg==WM_LBUTTONDOWN){int t=PtInTab(mx,my);if(t>=0){g_tab=(MetricTab)t;return true;}}
+    if(msg==WM_LBUTTONDOWN){int t=PtInTab(mx,my);if(t>=0&&t<=3){g_tab=(MetricTab)t;return true;}}
     if(msg==WM_LBUTTONDOWN&&PtInPanelHeader(mx,my)&&!PtInClose(mx,my)&&!PtInReset(mx,my)){g_dragging=true;g_dragMoved=false;g_dragOffX=mx-g_panelX;g_dragOffY=my-g_panelY;SetCapture(g_hWnd);return true;}
     if(msg==WM_MOUSEMOVE&&g_dragging){g_panelX=mx-g_dragOffX;g_panelY=my-g_dragOffY;if(g_panelX<0)g_panelX=0;if(g_panelY<0)g_panelY=0;if(g_panelX+PANEL_W>g_vpW)g_panelX=g_vpW-PANEL_W;g_dragMoved=true;return true;}
-    if(msg==WM_LBUTTONUP&&g_dragging){g_dragging=false;ReleaseCapture();return g_dragMoved;}
+    if(msg==WM_LBUTTONUP&&g_dragging){g_dragging=false;ReleaseCapture();if(g_dragMoved)SavePanelPos();return g_dragMoved;}
     return false;
 }
 static LRESULT CALLBACK CustomWndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     if(msg==WM_MOUSEMOVE||msg==WM_LBUTTONDOWN||msg==WM_LBUTTONUP)
         if(HandlePanelMouse(msg,lp))return 0;
+    if(msg==WM_MOUSEWHEEL&&g_panelVisible&&g_vpW>0){
+        // WM_MOUSEWHEEL : lParam = coordonnees ecran -> convertir en client
+        POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
+        ScreenToClient(hwnd,&pt);
+        if(pt.x>=g_panelX&&pt.x<g_panelX+PANEL_W&&pt.y>=g_panelY)
+        {   int delta=GET_WHEEL_DELTA_WPARAM(wp);
+            if(delta>0&&g_scrollOffset>0) --g_scrollOffset;
+            else if(delta<0) ++g_scrollOffset;
+            return 0;
+        }
+    }
     return CallWindowProcA(g_origProc,hwnd,msg,wp,lp);
 }
 static BOOL CALLBACK FindGameWnd(HWND hwnd,LPARAM){
@@ -1965,7 +2144,7 @@ static BOOL CALLBACK FindGameWnd(HWND hwnd,LPARAM){
 // ============================================================
 // Dechargement
 // ============================================================
-static HMODULE       g_hMod      = nullptr;
+// g_hMod declare en avant de fichier
 static volatile LONG g_unloading = 0;
 
 static void DoCleanup()
@@ -2003,6 +2182,7 @@ static DWORD WINAPI HookThread(LPVOID)
     Sleep(800);
     LogInit();
     Log("HookThread demarre");
+    LoadPanelPos();
 
     EnumWindows(FindGameWnd,0);
     if(g_hWnd) g_origProc=(WNDPROC)SetWindowLongPtrA(g_hWnd,GWLP_WNDPROC,(LONG_PTR)CustomWndProc);
