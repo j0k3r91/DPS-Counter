@@ -723,6 +723,9 @@ static void ParseEnter(const unsigned char* p, unsigned int sz)
     unsigned char objType = p[25];
     if (objType == GAME_PLAYER)
     {
+        // isFirstEnter : le client marque le propre personnage local avec ce flag.
+        // Offset 59 valide pour l'ancien client ; en V7 on s'appuie aussi sur la
+        // detection par nom (ci-dessous) pour etre robuste aux deux versions.
         bool isFirstEnter = (sz > 59) ? (p[59] != 0) : false;
         if (sz >= 89 + 19)
         {
@@ -1094,6 +1097,13 @@ static void DispatchPacket(const unsigned char* p, unsigned int sz)
             EntityInfo* e = FindEntity(h);
             if (e) e->active = false;
             EntCS_Leave();
+            // Si le joueur local quitte (changement de personnage / deconnexion),
+            // on remet g_localHandle a 0 pour que le prochain ENTER le detecte a nouveau.
+            if (h == g_localHandle) {
+                Log("LocalPlayer LEAVE h=%u -> reset localHandle", h);
+                g_localHandle       = 0;
+                g_localNameCache[0] = '\0';
+            }
         }
         break;
     case TM_SC_ATTACK_EVENT:
