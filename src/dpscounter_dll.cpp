@@ -611,9 +611,6 @@ static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg)
 {
     unsigned int localH = (unsigned int)(uintptr_t)pArg;
     if (!localH) return 0;
-    // Sur V7 le scan heap trouve systematiquement un mauvais nom (ancien perso en cache).
-    // Desactive entierement : le nom viendra de ParseEnter au prochain changement de zone.
-    if (g_clientV7) return 0;
     Sleep(1000);
     // Ne pas ecraser un nom deja fourni par un packet reseau (source autoritaire)
     if (g_localNameCache[0] && g_localNameFromPacket) return 0;
@@ -623,20 +620,27 @@ static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg)
 
     auto isNameChar = [](BYTE c) -> bool {
         return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-               (c >= '0' && c <= '9');  // pas de _ ni - : filtrage noms de stats (max_stamina etc.)
+               (c >= '0' && c <= '9');
     };
 
-    // Comptage de frequence : tous les candidats sont enregistres, le plus frequent gagne
+    // Sur V7 : fenetre ultra-serree handle+4 a handle+24 uniquement.
+    // La struct joueur en memoire a la forme [handle(4)][name(<=20)][nul].
+    // En utilisant l'offset exact, "Erzate" (ancien perso, handle different)
+    // n'apparait JAMAIS a handle+4 pour le handle courant -> plus de faux positif.
+    //
+    // Sur l'ancien client : fenetre large [-80,+80] avec vote (comme avant).
+    const bool tightScan = g_clientV7;
+
     struct NC { char name[24]; int count; };
     NC cands[64] = {}; int nCands = 0;
 
     BYTE* addr = (BYTE*)0x10000;
-    const LONGLONG SCAN_LIMIT = 128LL * 1024 * 1024; // reduit : heap privee ~64-128 MB suffit
+    const LONGLONG SCAN_LIMIT = 128LL * 1024 * 1024;
     LONGLONG scanned = 0;
 
     while (addr < (BYTE*)0x7FF00000 && scanned < SCAN_LIMIT)
     {
-        if (g_localNameCache[0]) break;
+        if (g_localNameCache[0] && g_localNameFromPacket) break;
         MEMORY_BASIC_INFORMATION mbi = {};
         if (!VirtualQuery(addr, &mbi, sizeof(mbi)) || mbi.RegionSize == 0) break;
 
@@ -655,38 +659,48 @@ static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg)
                     if (b[off]   != hBytes[0] || b[off+1] != hBytes[1] ||
                         b[off+2] != hBytes[2] || b[off+3] != hBytes[3]) continue;
 
-                    // Handle trouve : cherche un nom valide dans la fenetre [-80, +80]
-                    int wStart = (int)off - 80; if (wStart < 0) wStart = 0;
-                    int wEnd   = (int)off + 80; if ((SIZE_T)wEnd > s) wEnd = (int)s;
-
-                    for (int d = wStart; d < wEnd; )
+                    if (tightScan)
                     {
-                        if (!isNameChar(b[d])) { ++d; continue; }
-                        // Debut de string : le char precedent ne doit pas etre un name-char
-                        if (d > 0 && isNameChar(b[d-1])) { ++d; continue; }
+                        // V7 : nom attendu exactement a handle+4
+                        SIZE_T n = off + 4;
+                        if (n >= s) continue;
+                        // Doit commencer par une majuscule
+                        if (!(b[n] >= 'A' && b[n] <= 'Z')) continue;
                         int len = 0;
-                        while (len <= 20 && d + len < wEnd && isNameChar(b[d + len])) ++len;
-                        if (len < 4 || len > 20) { d += (len > 0 ? len : 1); continue; }
-                        // Doit etre null-termine
-                        if (d + len >= (int)s || b[d + len] != 0) { d += len; continue; }
-                        // Doit commencer par une MAJUSCULE (noms joueurs Rappelz) ;
-                        // les noms de stats/variables sont tous en minuscule.
-                        if (!(b[d] >= 'A' && b[d] <= 'Z'))
-                            { d += len + 1; continue; }
-
+                        while (len < 20 && n + len < s && isNameChar(b[n + len])) ++len;
+                        if (len < 2 || len > 20) continue;
+                        if (n + len >= s || b[n + len] != 0) continue;
                         char cand[24] = {};
-                        memcpy(cand, b + d, len);
+                        memcpy(cand, b + n, len);
                         bool found = false;
-                        for (int k = 0; k < nCands; ++k) {
-                            if (strcmp(cands[k].name, cand) == 0) {
-                                cands[k].count++; found = true; break;
-                            }
+                        for (int k = 0; k < nCands; ++k)
+                            if (strcmp(cands[k].name, cand) == 0) { cands[k].count++; found=true; break; }
+                        if (!found && nCands < 64)
+                            { memcpy(cands[nCands].name,cand,len+1); cands[nCands].count=1; nCands++; }
+                    }
+                    else
+                    {
+                        // Ancien client : fenetre large avec vote
+                        int wStart = (int)off - 80; if (wStart < 0) wStart = 0;
+                        int wEnd   = (int)off + 80; if ((SIZE_T)wEnd > s) wEnd = (int)s;
+                        for (int d = wStart; d < wEnd; )
+                        {
+                            if (!isNameChar(b[d])) { ++d; continue; }
+                            if (d > 0 && isNameChar(b[d-1])) { ++d; continue; }
+                            int len = 0;
+                            while (len <= 20 && d+len < wEnd && isNameChar(b[d+len])) ++len;
+                            if (len < 4 || len > 20) { d += (len>0?len:1); continue; }
+                            if (d+len >= (int)s || b[d+len] != 0) { d += len; continue; }
+                            if (!(b[d] >= 'A' && b[d] <= 'Z')) { d += len+1; continue; }
+                            char cand[24] = {};
+                            memcpy(cand, b+d, len);
+                            bool found = false;
+                            for (int k=0;k<nCands;++k)
+                                if (strcmp(cands[k].name,cand)==0){ cands[k].count++; found=true; break; }
+                            if (!found && nCands<64)
+                                { memcpy(cands[nCands].name,cand,len+1); cands[nCands].count=1; nCands++; }
+                            d += len+1;
                         }
-                        if (!found && nCands < 64) {
-                            memcpy(cands[nCands].name, cand, len + 1);
-                            cands[nCands].count = 1; nCands++;
-                        }
-                        d += len + 1;
                     }
                 }
             } __except(EXCEPTION_EXECUTE_HANDLER) {}
@@ -701,7 +715,7 @@ static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg)
     for (int k = 0; k < nCands; ++k)
         if (!best || cands[k].count > best->count) best = &cands[k];
 
-    if (best && best->count >= 1 && !g_localNameCache[0])
+    if (best && best->count >= 1 && !(g_localNameCache[0] && g_localNameFromPacket))
     {
         _snprintf_s(g_localNameCache, sizeof(g_localNameCache), _TRUNCATE, "%s", best->name);
         EntCS_Enter();
@@ -714,10 +728,11 @@ static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg)
             if (g_combat[ci].handle == localH)
                 _snprintf_s(g_combat[ci].name, sizeof(g_combat[ci].name), _TRUNCATE, "%s", best->name);
         StatsCS_Leave();
-        Log("ScanNameByHandle: h=0x%08X -> name=[%s] (count=%d/%d cands)", localH, best->name, best->count, nCands);
+        Log("ScanNameByHandle: h=0x%08X -> name=[%s] count=%d/%d cands (tight=%d)",
+            localH, best->name, best->count, nCands, (int)tightScan);
     }
     else
-        Log("ScanNameByHandle: aucun nom trouve pour h=0x%08X (nCands=%d)", localH, nCands);
+        Log("ScanNameByHandle: aucun nom pour h=0x%08X nCands=%d", localH, nCands);
 
     return 0;
 }
@@ -846,9 +861,7 @@ static void ParseEnter(const unsigned char* p, unsigned int sz)
                         // NE PAS propager le nom du pet vers le master (ils ont des noms differents).
                         if (g_localHandle == 0)
                             g_localHandle = master;
-                        // Sur V7, ne pas lancer le scan heap : trouve souvent un mauvais nom
-                        // (ancien perso en cache memoire). Le nom viendra de ParseEnter.
-                        if (!g_clientV7 && g_localHandle == master && !g_localNameCache[0]) {
+                        if (g_localHandle == master && !g_localNameFromPacket) {
                             Log("LocalPlayer from summon: h=0x%08X (scanning for name)", master);
                             CloseHandle(CreateThread(nullptr, 0, ScanNameByHandleThread,
                                                      (LPVOID)(uintptr_t)master, 0, nullptr));
@@ -1094,9 +1107,7 @@ static void ParseOpcode1000(const unsigned char* p, unsigned int sz)
         if (IsPlayerEntity(h) && g_localHandle == 0) {
             g_localHandle = h;
             Log("OPC1000: g_localHandle <- %u (0x%08X)", h, h);
-            // Sur V7, ne pas lancer le scan heap : il trouve souvent un mauvais nom
-            // (ancien personnage encore en cache memoire). Le nom viendra de ParseEnter.
-            if (!g_clientV7 && !g_localNameCache[0])
+            if (!g_localNameFromPacket)
                 CloseHandle(CreateThread(nullptr, 0, ScanNameByHandleThread, (LPVOID)(uintptr_t)h, 0, nullptr));
         }
     }
@@ -1932,11 +1943,9 @@ static void DrawDPSPanel(IDirect3DDevice9* dev)
     StatsCS_Leave();
 
     // Retry scan name si nom local toujours inconnu (toutes les 5s).
-    // Desactive sur V7 : le scan heap trouve souvent un mauvais nom (ancien perso en cache).
-    // Le nom viendra de ParseEnter au prochain changement de zone.
     {
         static DWORD s_lastScanRetry = 0;
-        if (!g_clientV7 && g_localHandle && !g_localNameCache[0] && now - s_lastScanRetry > 5000) {
+        if (g_localHandle && !g_localNameCache[0] && now - s_lastScanRetry > 5000) {
             s_lastScanRetry = now;
             CloseHandle(CreateThread(nullptr, 0, ScanNameByHandleThread,
                                      (LPVOID)(uintptr_t)(unsigned int)g_localHandle, 0, nullptr));
