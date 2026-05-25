@@ -644,12 +644,19 @@ static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg)
         MEMORY_BASIC_INFORMATION mbi = {};
         if (!VirtualQuery(addr, &mbi, sizeof(mbi)) || mbi.RegionSize == 0) break;
 
-        if (mbi.State == MEM_COMMIT &&
-            mbi.Type  == MEM_PRIVATE &&
-            !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
-            (mbi.Protect & (PAGE_EXECUTE_READ | PAGE_READONLY |
-                            PAGE_READWRITE | PAGE_WRITECOPY |
-                            PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        bool regionOk = (mbi.State == MEM_COMMIT) &&
+                        !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+                        (mbi.Protect & (PAGE_EXECUTE_READ | PAGE_READONLY |
+                                        PAGE_READWRITE | PAGE_WRITECOPY |
+                                        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+        // Sur V7 (fenetre serree) on accepte aussi MEM_MAPPED — la struct joueur peut
+        // ne pas etre dans le heap prive. Sur l'ancien client on garde MEM_PRIVATE.
+        if (tightScan)
+            regionOk = regionOk && (mbi.Type == MEM_PRIVATE || mbi.Type == MEM_MAPPED);
+        else
+            regionOk = regionOk && (mbi.Type == MEM_PRIVATE);
+
+        if (regionOk)
         {
             BYTE*  b = (BYTE*)mbi.BaseAddress;
             SIZE_T s = mbi.RegionSize;
@@ -661,22 +668,31 @@ static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg)
 
                     if (tightScan)
                     {
-                        // V7 : nom attendu exactement a handle+4
-                        SIZE_T n = off + 4;
-                        if (n >= s) continue;
-                        // Doit commencer par une majuscule
-                        if (!(b[n] >= 'A' && b[n] <= 'Z')) continue;
-                        int len = 0;
-                        while (len < 20 && n + len < s && isNameChar(b[n + len])) ++len;
-                        if (len < 2 || len > 20) continue;
-                        if (n + len >= s || b[n + len] != 0) continue;
-                        char cand[24] = {};
-                        memcpy(cand, b + n, len);
-                        bool found = false;
-                        for (int k = 0; k < nCands; ++k)
-                            if (strcmp(cands[k].name, cand) == 0) { cands[k].count++; found=true; break; }
-                        if (!found && nCands < 64)
-                            { memcpy(cands[nCands].name,cand,len+1); cands[nCands].count=1; nCands++; }
+                        // V7 : fenetre restreinte, offsets +4 a +24 apres le handle.
+                        // On garde la restriction offset positif uniquement pour eviter
+                        // les faux positifs (Erzate, etc. ne peuvent pas etre a +4..+24
+                        // d'un handle qui n'est pas le leur).
+                        for (SIZE_T delta = 4; delta <= 24; ++delta)
+                        {
+                            SIZE_T n = off + delta;
+                            if (n >= s) break;
+                            // Doit commencer par une majuscule
+                            if (!(b[n] >= 'A' && b[n] <= 'Z')) continue;
+                            // Le byte precedent ne doit pas etre un alphanum (debut de string)
+                            if (delta > 4 && n > 0 && isNameChar(b[n - 1])) continue;
+                            int len = 0;
+                            while (len < 20 && n + (SIZE_T)len < s && isNameChar(b[n + len])) ++len;
+                            if (len < 2 || len > 20) continue;
+                            // Null-termine OU fin de page (guard de securite)
+                            if (n + (SIZE_T)len < s && b[n + len] != 0) continue;
+                            char cand[24] = {};
+                            memcpy(cand, b + n, len);
+                            bool found = false;
+                            for (int k = 0; k < nCands; ++k)
+                                if (strcmp(cands[k].name, cand) == 0) { cands[k].count++; found=true; break; }
+                            if (!found && nCands < 64)
+                                { memcpy(cands[nCands].name,cand,len+1); cands[nCands].count=1; nCands++; }
+                        }
                     }
                     else
                     {
@@ -899,6 +915,17 @@ static void ParseAttackEvent(const unsigned char* p, unsigned int sz)
     }
 #endif
 
+    // V7 : OPC1000 (TM_SC_RESULT) n'existe pas — detecter le joueur local
+    // depuis le premier paquet d'attaque recue. 0x8... = joueur, 0xC... = pet.
+    if (g_clientV7 && g_localHandle == 0 &&
+        attacker != 0 && (attacker & 0xC0000000) == 0x80000000)
+    {
+        g_localHandle = attacker;
+        Log("ParseAttack V7: g_localHandle <- 0x%08X", attacker);
+        CloseHandle(CreateThread(nullptr, 0, ScanNameByHandleThread,
+                                 (LPVOID)(uintptr_t)attacker, 0, nullptr));
+    }
+
     const unsigned char* info = p + 22;
     int totalDmg = 0;
     for (unsigned int i = 0; i < count; ++i, info += infoStride)
@@ -939,6 +966,16 @@ static void ParseSkill(const unsigned char* p, unsigned int sz)
     static const unsigned char CANCEL         = 3;
     static const unsigned char REGION_FIRE    = 4;
     static const unsigned char COMPLETE       = 5;
+    // V7 : meme detection que ParseAttackEvent
+    if (g_clientV7 && g_localHandle == 0 &&
+        caster != 0 && (caster & 0xC0000000) == 0x80000000)
+    {
+        g_localHandle = caster;
+        Log("ParseSkill V7: g_localHandle <- 0x%08X", caster);
+        CloseHandle(CreateThread(nullptr, 0, ScanNameByHandleThread,
+                                 (LPVOID)(uintptr_t)caster, 0, nullptr));
+    }
+
     if (type != FIRE && type != REGION_FIRE) {
         Log("SKILL: type=%d ignored (not FIRE/REGION_FIRE) caster=%u sz=%u", (int)type, caster, sz);
         return;
