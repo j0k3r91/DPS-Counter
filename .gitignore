@@ -1,0 +1,28 @@
+# Fichiers de build CMake
+build_x86/
+
+# Logs générés par la DLL
+*.log
+
+# Fichiers Visual Studio
+*.user
+*.suo
+.vs/
+*.VC.db
+*.VC.opendb
+
+# Fichiers VS Code (garder .vscode/ si contient des settings utiles)
+.vscode/
+
+# Binaires générés
+*.dll
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Temporaires
+*.tmp
+Thumbs.db

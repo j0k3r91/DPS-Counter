@@ -1,0 +1,50 @@
+# Changelog
+
+Toutes les modifications notables sont documentées ici.  
+Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/).
+
+---
+
+## [1.0.0] — 2026-05-25
+
+### Ajouté
+- **Overlay DirectX 9** affiché en temps réel dans SFrame.exe
+- **Trois onglets** : DPS/s, Heal/s, Tank/s (dégâts reçus)
+- **Chrono temps réel** qui défile chaque seconde même sans dégâts
+- **Détection automatique** du joueur local via opcode 1000
+- **Détection pets / invocations** par heuristique handle V7 (`0xCxxxxxxx`),  
+  confirmée par `SC_ADD_PET_INFO` / `SC_ADD_SUMMON_INFO`
+- **Scan mémoire** du nom du joueur local avec système de vote (64 candidats)
+- **Colonnes** : DPS/s · Total · % du groupe · barre de progression
+- **Top DPS/s** dans l'en-tête avec timer `M:SS [ACT/FIN]`
+- **Glisser-déposer** du panel à la souris
+- **Double-clic** pour reset manuel du combat
+- **Ctrl+Clic** pour changer d'onglet
+- Support **client V7** (7 élémentaux, ~8.5 MB) et **ancien client** (17 élémentaux, ~9.5 MB)
+- Launcher `DPSCounter.exe` avec injection via `CreateRemoteThread` + `LoadLibraryA`
+- DLL embarquée en tableau C dans l'EXE (pas de fichier externe nécessaire)
+- Log `dpscounter.log` en temps réel (partagé en lecture)
+
+### Architecture technique
+- Hook **JMP E9** à RVA `0x47CB90` (post-cipher, pré-dispatch) — pile intacte
+- Décodage opcodes : 3, 9, 101, 301, 351, 401, 406, 1000
+- Handle format V7 : `0x8xxxxxxx` joueur / `0xCxxxxxxx` pet
+- Build MSVC x86, CRT statique (`/MT`), DirectX SDK June 2010
+- Timeout combat : 8 s sans coup → `[FIN]`
+
+### Corrections
+- Nom joueur affiché `#numéro` → scan mémoire + vote avec filtre majuscule
+- Parasite `max_stamina` dans le scan → retrait du caractère `_` des noms valides
+- Pet affiché comme 2ème joueur → détection immédiate par préfixe handle `0xC`
+- Valeur gonflée au 1er coup → reset complet des dégâts au nouveau combat
+- DPS/s doublé pendant < 1 s → diviseur minimum `1.0 s`
+- DPS/s qui descend à l'arrêt → DPS/s figé sur le dernier coup
+- Timer figé entre les coups → `now` utilisé pour le chrono pendant le combat
+- Timer incluait 8 s de FIGHT_TIMEOUT → timer s'arrête sur `lastHit`
+- Affichage `--` au premier coup → suppression des seuils de durée, `max(1 s, durée)`
+
+---
+
+## [Unreleased]
+
+_(aucune modification en attente)_
