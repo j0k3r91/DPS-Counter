@@ -68,6 +68,29 @@ Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/).
 
 ---
 
+## [1.1.1] — 2026-05-31
+
+### Corrections (détection nom joueur V7)
+
+- **`g_localHandle` depuis paquet** : sur le client V7 l'opcode 1000 (`TM_SC_RESULT`) est absent ;
+  `g_localHandle` est maintenant initialisé dès le premier paquet `ATTACK` ou `SKILL` portant
+  un handle `0x8xxxxxxx` (`ParseAttackEvent` / `ParseSkill`).
+- **Scan V7 offset strict `+4`** : `ScanNameByHandleThread` cherche le nom à l'offset
+  **exactement `+4`** (offset confirmé par Cheat Engine) — les offsets adjacents ne sont
+  plus testés, éliminant le faux-positif "Erzate".
+- **`ScanNameByHandleThread` désactivé sur V7** : sur le client V7 le nom du joueur local
+  arrive uniquement par scan direct à `handle+4` ; l'ancien chemin `ScanNameByHandle` est
+  court-circuité (early return) pour éviter les faux matches.
+- **Protection `g_localNameFromPacket`** : le scan heap ne peut plus écraser un nom
+  déjà reçu via paquet réseau (flag `g_localNameFromPacket` vérifié avant écriture).
+- **Détection changement de personnage robuste** : réception d'un `LEAVE` correspondant
+  au nom actuel remet `g_localHandle` à 0 et force un nouveau scan sur V7 ; test du nom
+  ajouté dans `ParseEnter` pour traiter les reconnexions rapides.
+- **Candidats loggés** : le scan V7 journalise tous les candidats avec leur score de vote
+  dans `dpscounter.log` (section `ScanNameByHandle`) pour faciliter le diagnostic.
+
+---
+
 ## [Unreleased]
 
 _(aucune modification en attente)_
