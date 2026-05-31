@@ -133,27 +133,23 @@ static bool ExtractDLL(char* outPath, int outLen)
 // ============================================================
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 {
-    // Si une instance est deja active, la fermer et continuer
+    // Si une instance est deja active, la fermer proprement avant de relancer
     HANDLE hMutex = CreateMutexA(nullptr, TRUE, MUTEX_NAME);
     if (GetLastError() == ERROR_ALREADY_EXISTS)
     {
-        CloseHandle(hMutex); hMutex = nullptr;
         // Signaler l'ancienne instance de se fermer
         HANDLE hEv = OpenEventA(EVENT_MODIFY_STATE, FALSE, EVENT_EXIT_NAME);
         if (hEv) { SetEvent(hEv); CloseHandle(hEv); }
-        // Attendre que l'ancienne instance libere le mutex (max 5s)
-        for (int i = 0; i < 50; ++i)
+        // Attendre que l'ancienne instance libere le mutex (WaitForSingleObject, robuste)
+        DWORD wr = WaitForSingleObject(hMutex, 8000);
+        if (wr != WAIT_OBJECT_0 && wr != WAIT_ABANDONED)
         {
-            Sleep(100);
-            hMutex = CreateMutexA(nullptr, TRUE, MUTEX_NAME);
-            if (GetLastError() != ERROR_ALREADY_EXISTS) break;
-            CloseHandle(hMutex); hMutex = nullptr;
-        }
-        if (!hMutex)
-        {
-            ShowError("Impossible de fermer l'instance precedente apres 5s.");
+            CloseHandle(hMutex);
+            ShowError("Impossible de fermer l'instance precedente apres 8s.");
             return 1;
         }
+        // Laisser la DLL finir de se decharger (retirer les hooks JMP + D3D)
+        Sleep(600);
     }
 
     // Chercher SFrame.exe
@@ -210,6 +206,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 
     Sleep(500);
     DeleteFileA(dllPath);
+    ReleaseMutex(hMutex);
     CloseHandle(hMutex);
     return 0;
 }

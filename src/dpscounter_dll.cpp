@@ -489,7 +489,10 @@ static CombatEntry    g_combat[MAX_COMBATANTS];
 static int            g_combatCount = 0;
 static DWORD          g_fightStart  = 0;
 static DWORD          g_fightEnd    = 0;
-static DWORD          g_lastHit     = 0;
+static DWORD          g_lastHit     = 0;  // max des trois — pour timeout global
+static DWORD          g_lastDmgOut  = 0;  // dernier evenement TAB_DPS
+static DWORD          g_lastHeal    = 0;  // dernier evenement TAB_HEAL
+static DWORD          g_lastDmgIn   = 0;  // dernier evenement TAB_RCVD
 static const DWORD    FIGHT_TIMEOUT = 5000;
 
 static CRITICAL_SECTION g_statsCS;
@@ -533,29 +536,40 @@ static void ResetCombat()
     memset(g_combat, 0, sizeof(CombatEntry) * g_combatCount);
     g_combatCount = 0;
     g_fightStart = g_fightEnd = g_lastHit = 0;
+    g_lastDmgOut = g_lastHeal = g_lastDmgIn = 0;
     g_scrollOffset = 0;
     StatsCS_Leave();
 }
-static void OnCombatEvent()
+static void OnCombatEvent(int tab)
 {
     DWORD now = GetTickCount();
+    if      (tab == TAB_DPS)  g_lastDmgOut = now;
+    else if (tab == TAB_HEAL) g_lastHeal   = now;
+    else                       g_lastDmgIn  = now;
+    g_lastHit = g_lastDmgOut;
+    if (g_lastHeal  > g_lastHit) g_lastHit = g_lastHeal;
+    if (g_lastDmgIn > g_lastHit) g_lastHit = g_lastDmgIn;
     if (g_fightStart == 0) {
         g_fightStart = now; g_fightEnd = 0;
     } else if (g_fightEnd != 0) {
-        // Nouveau combat apres une pause : on remet a zero les degats accumules
-        // (evite le total gonfle = ancien_total + nouveau_hit / ~0 secondes).
+        // Nouveau combat apres une pause : reset des donnees
         memset(g_combat, 0, sizeof(CombatEntry) * g_combatCount);
         g_combatCount = 0;
         g_fightStart = now; g_fightEnd = 0;
+        g_scrollOffset = 0;
+        g_lastDmgOut = g_lastHeal = g_lastDmgIn = 0;
+        if      (tab == TAB_DPS)  g_lastDmgOut = now;
+        else if (tab == TAB_HEAL) g_lastHeal   = now;
+        else                       g_lastDmgIn  = now;
+        g_lastHit = now;
     }
-    g_lastHit = now;
 }
 static void RecordDamageOut(unsigned int atk, int dmg)
 {
     if (dmg <= 0) return;
     InterlockedIncrement(&g_debugHits);
     StatsCS_Enter();
-    OnCombatEvent();
+    OnCombatEvent(TAB_DPS);
     CombatEntry* e = FindOrCreateCombat(atk);
     if (e) {
         e->dmgOut += dmg;
@@ -570,7 +584,7 @@ static void RecordHeal(unsigned int caster, int amount)
 {
     if (amount <= 0) return;
     StatsCS_Enter();
-    OnCombatEvent();
+    OnCombatEvent(TAB_HEAL);
     CombatEntry* e = FindOrCreateCombat(caster);
     if (e) {
         e->healOut += amount;
@@ -582,7 +596,7 @@ static void RecordDamageIn(unsigned int tgt, int dmg)
 {
     if (dmg <= 0) return;
     StatsCS_Enter();
-    OnCombatEvent();
+    OnCombatEvent(TAB_RCVD);
     CombatEntry* e = FindOrCreateCombat(tgt);
     if (e) {
         e->dmgIn += dmg;
@@ -1878,6 +1892,7 @@ static void DrawDPSPanel(IDirect3DDevice9* dev)
 
     StatsCS_Enter();
     DWORD fightStart = g_fightStart, fightEnd = g_fightEnd, lastHit = g_lastHit;
+    DWORD lastDmgOut = g_lastDmgOut, lastHeal = g_lastHeal, lastDmgIn = g_lastDmgIn;
     int   count = g_combatCount;
 
     SortRow rows[MAX_COMBATANTS * 2]; int rowCount = 0;
@@ -1958,19 +1973,25 @@ static void DrawDPSPanel(IDirect3DDevice9* dev)
         if (!rows[i].isPet) { groupTotal += rows[i].value; if (rows[i].value > maxVal) maxVal = rows[i].value; }
     if (groupTotal < 1) groupTotal = 1;
     DWORD now = GetTickCount();
-    // timerMs : chrono temps-reel (now si actif, lastHit si termine)
-    //           -> defile chaque seconde meme sans degats,
-    //              s'arrete exactement au dernier coup (sans le FIGHT_TIMEOUT)
-    DWORD timerEnd  = fightEnd ? lastHit : now;
-    DWORD timerMs   = fightStart ? (timerEnd - fightStart) : 0;
-    // dpsMs  : fige sur le dernier coup (DPS/s ne descend pas pendant les pauses)
-    DWORD dpsEnd    = lastHit ? lastHit : now;
-    DWORD durationMs  = fightStart ? (dpsEnd - fightStart) : 0;
+    // Timer independant par onglet :
+    //   DPS tab  -> lastDmgOut  /  HEAL tab -> lastHeal  /  TANK tab -> lastDmgIn
+    //   Max tab  -> lastDmgOut (meme temporalite que DPS)
+    DWORD tabLastHit = (g_tab == TAB_HEAL) ? lastHeal :
+                       (g_tab == TAB_RCVD) ? lastDmgIn : lastDmgOut;
+    // Onglet actif = fight en cours ET cet onglet a eu une activite recente
+    bool  tabIsActive = fightStart && !fightEnd && tabLastHit &&
+                        (now - tabLastHit <= FIGHT_TIMEOUT);
+    // Timer d'affichage : defileait tant qu'actif, gele sur tabLastHit sinon
+    DWORD timerEnd  = tabIsActive ? now : (tabLastHit ? tabLastHit : fightStart);
+    DWORD timerMs   = (fightStart && timerEnd >= fightStart) ? (timerEnd - fightStart) : 0;
+    // Diviseur /s : gele sur tabLastHit -> le score ne descend plus si l'onglet est inactif
+    DWORD durationMs  = (fightStart && tabLastHit && tabLastHit >= fightStart)
+                        ? (tabLastHit - fightStart) : 0;
     float durationSec = durationMs / 1000.0f;
     float timerSec    = timerMs   / 1000.0f;
     LONGLONG topDmg   = (rowCount>0&&!rows[0].isPet) ? rows[0].value : 0;
     float effSec      = (durationSec > 1.0f) ? durationSec : 1.0f;
-    float topDps      = (topDmg > 0) ? (float)(topDmg / effSec) : 0.f;
+    float topDps      = (topDmg > 0 && g_tab == TAB_DPS) ? (float)(topDmg / effSec) : 0.f;
     StatsCS_Leave();
 
     // Retry scan name si nom local toujours inconnu (toutes les 5s).
@@ -2046,11 +2067,12 @@ static void DrawDPSPanel(IDirect3DDevice9* dev)
 
     // Infos combat
     {char info[80];
-     if (!fightStart) _snprintf_s(info,sizeof(info),_TRUNCATE,"En attente...");
+     if (!fightStart || !tabLastHit) _snprintf_s(info,sizeof(info),_TRUNCATE,"En attente...");
      else{int sec=(int)(timerMs/1000),mn=sec/60;sec%=60;
+          const char* st=tabIsActive?"[ACT]":"[FIN]";
           if(g_tab==TAB_DPS&&topDps>0)
-              _snprintf_s(info,sizeof(info),_TRUNCATE,"%d:%02d  Top: %.0f/s  %s",mn,sec,topDps,fightEnd?"[FIN]":"[ACT]");
-          else _snprintf_s(info,sizeof(info),_TRUNCATE,"%d:%02d  %s",mn,sec,fightEnd?"[FIN]":"[ACT]");}
+              _snprintf_s(info,sizeof(info),_TRUNCATE,"%d:%02d  Top: %.0f/s  %s",mn,sec,topDps,st);
+          else _snprintf_s(info,sizeof(info),_TRUNCATE,"%d:%02d  %s",mn,sec,st);}
      RECT ir={px+4,py+53,px+pw-4,py+PANEL_HEADER-1};
      DrawText2(g_fontSmall,info,ir,DT_LEFT|DT_VCENTER,D3DCOLOR_ARGB(220,180,200,255));}
 
