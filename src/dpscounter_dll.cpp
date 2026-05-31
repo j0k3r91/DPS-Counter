@@ -2352,6 +2352,11 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
         break;
     case DLL_PROCESS_DETACH:
         DoCleanup();
+        // Signaler le launcher pour qu'il se termine proprement quand le jeu ferme
+        {
+            HANDLE hEv = OpenEventA(EVENT_MODIFY_STATE, FALSE, "Local\\DPSCounterExit");
+            if (hEv) { SetEvent(hEv); CloseHandle(hEv); }
+        }
         break;
     }
     return TRUE;

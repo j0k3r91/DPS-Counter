@@ -133,14 +133,27 @@ static bool ExtractDLL(char* outPath, int outLen)
 // ============================================================
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 {
-    // Une seule instance du launcher
+    // Si une instance est deja active, la fermer et continuer
     HANDLE hMutex = CreateMutexA(nullptr, TRUE, MUTEX_NAME);
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        if (hMutex) CloseHandle(hMutex);
-        MessageBoxA(nullptr,
-            "DPS Counter est deja actif.",
-            "DPS Counter", MB_OK | MB_ICONINFORMATION);
-        return 0;
+    if (GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        CloseHandle(hMutex); hMutex = nullptr;
+        // Signaler l'ancienne instance de se fermer
+        HANDLE hEv = OpenEventA(EVENT_MODIFY_STATE, FALSE, EVENT_EXIT_NAME);
+        if (hEv) { SetEvent(hEv); CloseHandle(hEv); }
+        // Attendre que l'ancienne instance libere le mutex (max 5s)
+        for (int i = 0; i < 50; ++i)
+        {
+            Sleep(100);
+            hMutex = CreateMutexA(nullptr, TRUE, MUTEX_NAME);
+            if (GetLastError() != ERROR_ALREADY_EXISTS) break;
+            CloseHandle(hMutex); hMutex = nullptr;
+        }
+        if (!hMutex)
+        {
+            ShowError("Impossible de fermer l'instance precedente apres 5s.");
+            return 1;
+        }
     }
 
     // Chercher SFrame.exe
