@@ -94,3 +94,17 @@ Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/).
 ## [Unreleased]
 
 _(aucune modification en attente)_
+
+---
+
+## [1.1.2] — 2026-06-09
+
+### Corrections
+
+- **Relancement robuste** : si une instance précédente du DPS meter est encore active,
+  elle est fermée automatiquement avant nouveau chargement.
+- **Stabilité des timers par onglet** : les timers DPS/Heal/Tank sont désormais
+  indépendants par onglet, avec reprise/gel cohérents selon l'activité.
+- **Molette limitée au panneau** : le scroll du DPS meter ne s'applique plus si le
+  curseur n'est pas sur la fenêtre/panneau du compteur, tout en laissant la molette
+  fonctionner normalement dans le jeu.
