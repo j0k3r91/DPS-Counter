@@ -1745,6 +1745,7 @@ static bool g_dragging = false, g_dragMoved = false;
 static int  g_dragOffX = 0, g_dragOffY = 0;
 static bool g_closeHover = false, g_resetHover = false;
 static bool g_tab0Hover = false, g_tab1Hover = false, g_tab2Hover = false, g_tab3Hover = false;
+static int  g_panelH = PANEL_HEADER + 14 + MAX_ROWS * ROW_H + 4;
 // g_scrollOffset declare en avant de fichier
 
 // ============================================================
@@ -2023,6 +2024,7 @@ static void DrawDPSPanel(IDirect3DDevice9* dev)
     int visRows = 0;
     for (int i = g_scrollOffset; i < rowCount && visRows < MAX_ROWS; ++i) ++visRows;
     int panelH = PANEL_HEADER + 14 + visRows*ROW_H + 4;
+    g_panelH = panelH;
     int px=g_panelX, py=g_panelY, pw=PANEL_W;
 
     FillRect2D(dev,px,py,pw,panelH,D3DCOLOR_ARGB(210,15,15,20));
@@ -2235,10 +2237,16 @@ static LRESULT CALLBACK CustomWndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     if(msg==WM_MOUSEMOVE||msg==WM_LBUTTONDOWN||msg==WM_LBUTTONUP)
         if(HandlePanelMouse(msg,lp))return 0;
     if(msg==WM_MOUSEWHEEL&&g_panelVisible&&g_vpW>0){
-        // WM_MOUSEWHEEL : lParam = coordonnees ecran -> convertir en client
+        // WM_MOUSEWHEEL : lParam = coordonnees ecran.
+        // Ne traiter que si la souris est vraiment sur notre fenetre.
         POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
+        HWND hover=WindowFromPoint(pt);
+        if(hover!=hwnd&&!IsChild(hwnd,hover))
+            return CallWindowProcA(g_origProc,hwnd,msg,wp,lp);
+
+        // Convertir ensuite en client pour test hitbox panneau.
         ScreenToClient(hwnd,&pt);
-        if(pt.x>=g_panelX&&pt.x<g_panelX+PANEL_W&&pt.y>=g_panelY)
+        if(pt.x>=g_panelX&&pt.x<g_panelX+PANEL_W&&pt.y>=g_panelY&&pt.y<g_panelY+g_panelH)
         {   int delta=GET_WHEEL_DELTA_WPARAM(wp);
             if(delta>0&&g_scrollOffset>0) --g_scrollOffset;
             else if(delta<0) ++g_scrollOffset;
