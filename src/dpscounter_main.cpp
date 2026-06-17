@@ -25,6 +25,7 @@
 // Configuration
 // ============================================================
 static const char* TARGET_EXE      = "SFrame.exe";
+static const char* TARGET_EXE_ALT  = "sfram.exe";
 static const char* MUTEX_NAME      = "Local\\DPSCounterRunning";
 static const char* EVENT_EXIT_NAME = "Local\\DPSCounterExit";
 // Nom unique a chaque lancement (timestamp) pour forcer LoadLibraryA a recharger
@@ -152,14 +153,15 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         Sleep(600);
     }
 
-    // Chercher SFrame.exe
+    // Chercher SFrame.exe (fallback sfram.exe selon variantes client)
     DWORD pid = 0;
     for (int i = 0; i < 60 && pid == 0; ++i) {
         pid = FindProcessByName(TARGET_EXE);
+        if (pid == 0) pid = FindProcessByName(TARGET_EXE_ALT);
         if (pid == 0) {
             if (i == 0) {
                 int r = MessageBoxA(nullptr,
-                    "SFrame.exe n'est pas detecte.\n"
+                    "SFrame.exe (ou sfram.exe) n'est pas detecte.\n"
                     "Lancez le jeu puis cliquez OK, ou Annuler pour quitter.",
                     "DPS Counter", MB_OKCANCEL | MB_ICONQUESTION);
                 if (r != IDOK) { CloseHandle(hMutex); return 0; }
@@ -170,7 +172,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 
     if (pid == 0) {
         CloseHandle(hMutex);
-        ShowError("SFrame.exe introuvable apres attente. Abandon.");
+        ShowError("SFrame.exe/sfram.exe introuvable apres attente. Abandon.");
         return 1;
     }
 

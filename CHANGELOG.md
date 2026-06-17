@@ -93,7 +93,16 @@ Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/).
 
 ## [Unreleased]
 
-_(aucune modification en attente)_
+### Ajouté
+
+- **Support client 6.3** : nouveau pattern réseau `NET_HOOK_PATTERN_63` basé sur
+  `cmp [ebp],eax ; ja ; movzx ecx,[ebp+4]`, avec stub dédié.
+
+### Amélioré
+
+- **Détection de variante client plus robuste** : priorité aux signatures de hook
+  (ancien / V7 / 6.3), puis fallback sur `SizeOfImage`.
+- **Launcher** : recherche du process étendue à `sfram.exe` en fallback.
 
 ---
 

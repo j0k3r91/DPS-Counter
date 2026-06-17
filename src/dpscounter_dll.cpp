@@ -115,6 +115,7 @@ static void Log(const char* fmt, ...)
 // Prototypes forward
 // ============================================================
 static DWORD WINAPI UnloadThread(LPVOID);
+static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg);
 
 // ============================================================
 // Constantes opcodes Rappelz
@@ -261,6 +262,46 @@ static volatile unsigned int g_localHandle = 0;
 static char g_localNameCache[24] = {};
 static volatile LONG g_handleScanDone = 0;
 
+// Evite de lancer plusieurs scans concurents pour le meme handle.
+static CRITICAL_SECTION g_nameScanCS;
+static unsigned int     g_nameScanHandles[256] = {};
+static int              g_nameScanCount = 0;
+
+static void NameScanCS_Init() { InitializeCriticalSection(&g_nameScanCS); }
+
+static bool TryQueueNameScan(unsigned int h)
+{
+    if (!h) return false;
+    EnterCriticalSection(&g_nameScanCS);
+    for (int i = 0; i < g_nameScanCount; ++i)
+    {
+        if (g_nameScanHandles[i] == h)
+        {
+            LeaveCriticalSection(&g_nameScanCS);
+            return false;
+        }
+    }
+    if (g_nameScanCount < (int)(sizeof(g_nameScanHandles) / sizeof(g_nameScanHandles[0])))
+        g_nameScanHandles[g_nameScanCount++] = h;
+    LeaveCriticalSection(&g_nameScanCS);
+    return true;
+}
+
+static void MarkNameScanDone(unsigned int h)
+{
+    EnterCriticalSection(&g_nameScanCS);
+    for (int i = 0; i < g_nameScanCount; ++i)
+    {
+        if (g_nameScanHandles[i] == h)
+        {
+            g_nameScanHandles[i] = g_nameScanHandles[g_nameScanCount - 1];
+            g_nameScanCount--;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_nameScanCS);
+}
+
 // Scan le heap en background pour trouver le handle du local player.
 // Strategie 1 : cherche le pointeur vers la string statique du nom (const char*) sur le heap.
 // Strategie 2 : cherche la string du nom en ligne sur le heap (fallback).
@@ -402,9 +443,8 @@ static void GetEntityName(unsigned int h, char* out, int outLen)
     EntityInfo* e = FindEntity(h);
     if (e && e->name[0])
         _snprintf_s(out, outLen, outLen-1, "%s", e->name);
-    // Fallback localNameCache UNIQUEMENT si le nom vient d'un packet reseau (fiable).
-    // Si le nom vient du scan heap seulement, on affiche #handle plutot qu'un nom incorrect.
-    else if (h == g_localHandle && g_localNameCache[0] && g_localNameFromPacket)
+    // Fallback local: affiche le nom local meme s'il vient du scan memoire.
+    else if (h == g_localHandle && g_localNameCache[0])
         _snprintf_s(out, outLen, outLen-1, "%s", g_localNameCache);
     else
         _snprintf_s(out, outLen, outLen-1, "#%u", h);
@@ -517,6 +557,13 @@ static CombatEntry* FindOrCreateCombat(unsigned int h)
     EntityInfo* ei = FindEntity(h);
     e->isPet = (ei && ei->master_handle != 0);
     EntCS_Leave();
+
+    // Fallback 6.3: si le nom n'est pas encore connu (#handle), tenter un scan memoire
+    // pour mapper [handle]->name meme sans packet ENTER exploitable.
+    if (e->name[0] == '#' && (h & 0x80000000u) && TryQueueNameScan(h))
+        CloseHandle(CreateThread(nullptr, 0, ScanNameByHandleThread,
+                                 (LPVOID)(uintptr_t)h, 0, nullptr));
+
     // Heuristique injection tardive : en Rappelz V7, les pets/invocations ont des handles
     // de la forme 0xCxxxxxxx (bit31+bit30), les joueurs 0x8xxxxxxx (bit31 seul).
     // Si l'entite est inconnue et ressemble a un pet, on l'attribue directement au
@@ -625,16 +672,74 @@ static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg)
 {
     unsigned int localH = (unsigned int)(uintptr_t)pArg;
     if (!localH) return 0;
+    const bool isLocalTarget = (localH == g_localHandle);
     Sleep(1000);
     // Ne pas ecraser un nom deja fourni par un packet reseau (source autoritaire)
-    if (g_localNameCache[0] && g_localNameFromPacket) return 0;
+    if (isLocalTarget && g_localNameCache[0] && g_localNameFromPacket) { MarkNameScanDone(localH); return 0; }
 
     BYTE hBytes[4];
     memcpy(hBytes, &localH, 4);
 
+    struct NC { char name[24]; int count; };
+    NC cands[64] = {}; int nCands = 0;
+
     auto isNameChar = [](BYTE c) -> bool {
         return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-               (c >= '0' && c <= '9');
+               (c >= '0' && c <= '9') || c == '_' || c == '-';
+    };
+
+    auto isNameStart = [](BYTE c) -> bool {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+    };
+
+    auto addCandidate = [&](const char* cand, int len)
+    {
+        if (!cand || len < 2 || len > 20) return;
+        char tmp[24] = {};
+        memcpy(tmp, cand, len);
+        bool found = false;
+        for (int k = 0; k < nCands; ++k)
+            if (strcmp(cands[k].name, tmp) == 0) { cands[k].count++; found = true; break; }
+        if (!found && nCands < 64)
+            { memcpy(cands[nCands].name, tmp, len+1); cands[nCands].count = 1; nCands++; }
+    };
+
+    auto readAsciiAt = [&](const BYTE* b, SIZE_T s, SIZE_T pos, char* out, int outSz) -> int
+    {
+        if (!b || !out || outSz < 2 || pos >= s) return 0;
+        if (!isNameStart(b[pos])) return 0;
+        int len = 0;
+        while (len < outSz - 1 && pos + (SIZE_T)len < s && isNameChar(b[pos + len])) ++len;
+        if (len < 2 || len > 20) return 0;
+        if (pos + (SIZE_T)len >= s || b[pos + len] != 0) return 0;
+        memcpy(out, b + pos, len);
+        out[len] = 0;
+        return len;
+    };
+
+    auto readUtf16At = [&](const BYTE* b, SIZE_T s, SIZE_T pos, char* out, int outSz) -> int
+    {
+        if (!b || !out || outSz < 2 || pos + 1 >= s) return 0;
+        BYTE c0 = b[pos];
+        BYTE z0 = b[pos + 1];
+        if (z0 != 0 || !isNameStart(c0)) return 0;
+        int len = 0;
+        while (len < outSz - 1)
+        {
+            SIZE_T idx = pos + (SIZE_T)len * 2;
+            if (idx + 1 >= s) return 0;
+            BYTE c = b[idx];
+            BYTE z = b[idx + 1];
+            if (z != 0) return 0;
+            if (c == 0) break;
+            if (!isNameChar(c)) return 0;
+            out[len++] = (char)c;
+        }
+        if (len < 2 || len > 20) return 0;
+        SIZE_T endIdx = pos + (SIZE_T)len * 2;
+        if (endIdx + 1 >= s || b[endIdx] != 0 || b[endIdx + 1] != 0) return 0;
+        out[len] = 0;
+        return len;
     };
 
     // Sur V7 : fenetre ultra-serree handle+4 a handle+24 uniquement.
@@ -645,21 +750,18 @@ static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg)
     // Sur l'ancien client : fenetre large [-80,+80] avec vote (comme avant).
     const bool tightScan = g_clientV7;
 
-    struct NC { char name[24]; int count; };
-    NC cands[64] = {}; int nCands = 0;
-
     BYTE* addr = (BYTE*)0x10000;
-    const LONGLONG SCAN_LIMIT = 128LL * 1024 * 1024;
+    const LONGLONG SCAN_LIMIT = 384LL * 1024 * 1024;
     LONGLONG scanned = 0;
 
     while (addr < (BYTE*)0x7FF00000 && scanned < SCAN_LIMIT)
     {
-        if (g_localNameCache[0] && g_localNameFromPacket) break;
+        if (isLocalTarget && g_localNameCache[0] && g_localNameFromPacket) break;
         MEMORY_BASIC_INFORMATION mbi = {};
         if (!VirtualQuery(addr, &mbi, sizeof(mbi)) || mbi.RegionSize == 0) break;
 
         bool regionOk = (mbi.State == MEM_COMMIT) &&
-                        (mbi.Type == MEM_PRIVATE) &&
+                (mbi.Type == MEM_PRIVATE || mbi.Type == MEM_MAPPED || mbi.Type == MEM_IMAGE) &&
                         !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
                         (mbi.Protect & (PAGE_EXECUTE_READ | PAGE_READONLY |
                                         PAGE_READWRITE | PAGE_WRITECOPY |
@@ -677,24 +779,56 @@ static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg)
 
                     if (tightScan)
                     {
-                        // V7 : offset STRICTEMENT +4, confirme par CE.
-                        // Layout memoire : [handle(4)][name(<=20)][nul].
-                        // Ne PAS elargir : delta 5..24 genere des faux positifs (Erzate
-                        // peut apparaitre a d'autres offsets dans des structs non-joueur).
-                        SIZE_T n = off + 4;
-                        if (n >= s) continue;
-                        if (!(b[n] >= 'A' && b[n] <= 'Z')) continue;
-                        int len = 0;
-                        while (len < 20 && n + (SIZE_T)len < s && isNameChar(b[n + len])) ++len;
-                        if (len < 2 || len > 20) continue;
-                        if (n + (SIZE_T)len >= s || b[n + len] != 0) continue;
-                        char cand[24] = {};
-                        memcpy(cand, b + n, len);
-                        bool found = false;
-                        for (int k = 0; k < nCands; ++k)
-                            if (strcmp(cands[k].name, cand) == 0) { cands[k].count++; found=true; break; }
-                        if (!found && nCands < 64)
-                            { memcpy(cands[nCands].name,cand,len+1); cands[nCands].count=1; nCands++; }
+                        // 6.3: le nom peut etre inline ASCII/UTF-16 a plusieurs offsets,
+                        // ou indirect via pointeur proche de la structure contenant le handle.
+                        static const int kNameOffsets[] = {4,8,12,16,20,24,28,32,36,40,44,48};
+                        for (int oi = 0; oi < (int)(sizeof(kNameOffsets)/sizeof(kNameOffsets[0])); ++oi)
+                        {
+                            SIZE_T n = off + (SIZE_T)kNameOffsets[oi];
+                            if (n >= s) continue;
+                            char cand[24] = {};
+                            int lenA = readAsciiAt(b, s, n, cand, (int)sizeof(cand));
+                            if (lenA > 0) addCandidate(cand, lenA);
+                            int lenU = readUtf16At(b, s, n, cand, (int)sizeof(cand));
+                            if (lenU > 0) addCandidate(cand, lenU);
+                        }
+
+                        for (int pd = -16; pd <= 48; pd += 4)
+                        {
+                            ptrdiff_t p2 = (ptrdiff_t)off + pd;
+                            if (p2 < 0 || p2 + 4 > (ptrdiff_t)s) continue;
+                            unsigned int pv = 0;
+                            memcpy(&pv, b + p2, 4);
+                            if (pv < 0x10000u || pv > 0x7FF00000u) continue;
+                            __try {
+                                const BYTE* pb = (const BYTE*)(uintptr_t)pv;
+                                char cand[24] = {};
+                                int lenA = 0;
+                                if (isNameStart(pb[0])) {
+                                    while (lenA < 20 && isNameChar(pb[lenA])) ++lenA;
+                                    if (lenA >= 2 && lenA <= 20 && pb[lenA] == 0) {
+                                        memcpy(cand, pb, lenA);
+                                        cand[lenA] = 0;
+                                        addCandidate(cand, lenA);
+                                    }
+                                }
+                                if (pb[1] == 0 && isNameStart(pb[0])) {
+                                    int lenU = 0;
+                                    while (lenU < 20) {
+                                        BYTE c = pb[lenU * 2];
+                                        BYTE z = pb[lenU * 2 + 1];
+                                        if (z != 0) { lenU = 0; break; }
+                                        if (c == 0) break;
+                                        if (!isNameChar(c)) { lenU = 0; break; }
+                                        cand[lenU++] = (char)c;
+                                    }
+                                    if (lenU >= 2 && lenU <= 20 && pb[lenU * 2] == 0 && pb[lenU * 2 + 1] == 0) {
+                                        cand[lenU] = 0;
+                                        addCandidate(cand, lenU);
+                                    }
+                                }
+                            } __except(EXCEPTION_EXECUTE_HANDLER) {}
+                        }
                     }
                     else
                     {
@@ -740,14 +874,17 @@ static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg)
         Log("  cand[%d]: [%s] count=%d%s", k, cands[k].name, cands[k].count,
             (best == &cands[k]) ? " <-- WINNER" : "");
 
-    if (best && best->count >= 1 && !(g_localNameCache[0] && g_localNameFromPacket))
+    if (best && best->count >= 1)
     {
-        _snprintf_s(g_localNameCache, sizeof(g_localNameCache), _TRUNCATE, "%s", best->name);
         EntCS_Enter();
         EntityInfo* mei = AllocEntity(localH);
-        if (mei && !mei->name[0])
+        if (mei && (!mei->name[0] || isLocalTarget))
             _snprintf_s(mei->name, sizeof(mei->name), _TRUNCATE, "%s", best->name);
         EntCS_Leave();
+
+        if (isLocalTarget && !(g_localNameCache[0] && g_localNameFromPacket))
+            _snprintf_s(g_localNameCache, sizeof(g_localNameCache), _TRUNCATE, "%s", best->name);
+
         StatsCS_Enter();
         for (int ci = 0; ci < g_combatCount; ++ci)
             if (g_combat[ci].handle == localH)
@@ -758,6 +895,7 @@ static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg)
     else
         Log("ScanNameByHandle: aucun nom pour h=0x%08X nCands=%d", localH, nCands);
 
+    MarkNameScanDone(localH);
     return 0;
 }
 
@@ -887,8 +1025,9 @@ static void ParseEnter(const unsigned char* p, unsigned int sz)
                             g_localHandle = master;
                         if (g_localHandle == master && !g_localNameFromPacket) {
                             Log("LocalPlayer from summon: h=0x%08X (scanning for name)", master);
-                            CloseHandle(CreateThread(nullptr, 0, ScanNameByHandleThread,
-                                                     (LPVOID)(uintptr_t)master, 0, nullptr));
+                            if (TryQueueNameScan(master))
+                                CloseHandle(CreateThread(nullptr, 0, ScanNameByHandleThread,
+                                                         (LPVOID)(uintptr_t)master, 0, nullptr));
                         }
                     }
                 }
@@ -930,8 +1069,9 @@ static void ParseAttackEvent(const unsigned char* p, unsigned int sz)
     {
         g_localHandle = attacker;
         Log("ParseAttack V7: g_localHandle <- 0x%08X", attacker);
-        CloseHandle(CreateThread(nullptr, 0, ScanNameByHandleThread,
-                                 (LPVOID)(uintptr_t)attacker, 0, nullptr));
+        if (TryQueueNameScan(attacker))
+            CloseHandle(CreateThread(nullptr, 0, ScanNameByHandleThread,
+                                     (LPVOID)(uintptr_t)attacker, 0, nullptr));
     }
 
     const unsigned char* info = p + 22;
@@ -980,8 +1120,9 @@ static void ParseSkill(const unsigned char* p, unsigned int sz)
     {
         g_localHandle = caster;
         Log("ParseSkill V7: g_localHandle <- 0x%08X", caster);
-        CloseHandle(CreateThread(nullptr, 0, ScanNameByHandleThread,
-                                 (LPVOID)(uintptr_t)caster, 0, nullptr));
+        if (TryQueueNameScan(caster))
+            CloseHandle(CreateThread(nullptr, 0, ScanNameByHandleThread,
+                                     (LPVOID)(uintptr_t)caster, 0, nullptr));
     }
 
     if (type != FIRE && type != REGION_FIRE) {
@@ -1153,7 +1294,10 @@ static void ParseOpcode1000(const unsigned char* p, unsigned int sz)
             g_localHandle = h;
             Log("OPC1000: g_localHandle <- %u (0x%08X)", h, h);
             if (!g_localNameFromPacket)
-                CloseHandle(CreateThread(nullptr, 0, ScanNameByHandleThread, (LPVOID)(uintptr_t)h, 0, nullptr));
+            {
+                if (TryQueueNameScan(h))
+                    CloseHandle(CreateThread(nullptr, 0, ScanNameByHandleThread, (LPVOID)(uintptr_t)h, 0, nullptr));
+            }
         }
     }
 }
@@ -1405,7 +1549,24 @@ static const unsigned char NET_HOOK_PATTERN_V7[] = {
 };
 static const int NET_HOOK_OFFSET_V7 = 8; // offset du pattern vers le hook site
 
-struct JmpHook { void* pSite; void* pStub; bool installed; bool isV7; };
+// Client 6.3 observe (SFrame.exe ~12.6 MB) :
+//   cmp [ebp],eax ; ja erreur ; movzx ecx,[ebp+4]
+// Hook site = offset 9 (sur movzx ecx,[ebp+4])
+static const unsigned char NET_HOOK_PATTERN_63[] = {
+    0x39, 0x45, 0x00,                     // cmp [ebp+00],eax
+    0x0F, 0x87, 0xE4, 0x11, 0x00, 0x00,  // ja +0x11E4
+    0x0F, 0xB7, 0x4D, 0x04               // movzx ecx,word ptr [ebp+04]  <- hook ici
+};
+static const int NET_HOOK_OFFSET_63 = 9;
+
+enum NetHookKind {
+    NET_HOOK_NONE = 0,
+    NET_HOOK_OLD  = 1,
+    NET_HOOK_V7   = 2,
+    NET_HOOK_63   = 3
+};
+
+struct JmpHook { void* pSite; void* pStub; bool installed; int kind; };
 static JmpHook g_netHook = {};
 
 // Callback V7 : appele depuis le stub avec edi = TS_MESSAGE*.
@@ -1490,103 +1651,170 @@ static bool InstallNetworkHook()
         g_netHook.pSite     = hookSite;
         g_netHook.pStub     = stub;
         g_netHook.installed = true;
-        g_netHook.isV7      = false;
+        g_netHook.kind      = NET_HOOK_OLD;
         Log("Hook reseau (ancien) OK : site=%p stub=%p", hookSite, stub);
         return true;
     }
 
-    // --- Tentative 2 : nouveau client V7 (Sframe.exe 7-elem) ---
-    if (!g_clientV7)
-    {
-        Log("NET_HOOK_PATTERN introuvable et client non-V7 : hook impossible");
-        return false;
-    }
-
+    // --- Tentative 2 : client V7 ---
     patAddr = ScanPattern(NET_HOOK_PATTERN_V7, sizeof(NET_HOOK_PATTERN_V7));
-    if (!patAddr)
+    if (patAddr)
     {
-        Log("NET_HOOK_PATTERN_V7 introuvable");
-        return false;
-    }
+        BYTE* hookSite = (BYTE*)patAddr + NET_HOOK_OFFSET_V7;
+        Log("Pattern V7 @ %p, hookSite @ %p", patAddr, hookSite);
 
-    BYTE* hookSite = (BYTE*)patAddr + NET_HOOK_OFFSET_V7;
-    Log("Pattern V7 @ %p, hookSite @ %p", patAddr, hookSite);
+        BYTE* stub = (BYTE*)VirtualAlloc(nullptr, 128,
+                         MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!stub) { Log("VirtualAlloc stub V7 FAIL err=%lu", GetLastError()); return false; }
 
-    BYTE* stub = (BYTE*)VirtualAlloc(nullptr, 128,
-                     MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!stub) { Log("VirtualAlloc stub V7 FAIL err=%lu", GetLastError()); return false; }
+        // --------------------------------------------------------
+        // Stub V7
+        // Entree via JMP : edi = TS_MESSAGE* (packet complet, valide)
+        // On appelle V7PacketCallback(edi) en cdecl puis on restaure eax,ecx,edx,esi.
+        // edi doit rester intact (utilise apres le retour).
+        // Bytes voles (6) : 0F B7 4F 04 (movzx ecx,[edi+4]) + 8B C1 (mov eax,ecx)
+        // Orphan byte a hookSite+5 = 0xC1 (jamais execute)
+        // JMP retour -> hookSite+6
+        // --------------------------------------------------------
+        BYTE* s = stub;
 
-    // --------------------------------------------------------
-    // Stub V7
-    // Entree via JMP : edi = TS_MESSAGE* (packet complet, valide)
-    // On appelle V7PacketCallback(edi) en cdecl puis on restaure eax,ecx,edx,esi.
-    // edi doit rester intact (utilise apres le retour).
-    // Bytes voles (6) : 0F B7 4F 04 (movzx ecx,[edi+4]) + 8B C1 (mov eax,ecx)
-    // Orphan byte a hookSite+5 = 0xC1 (jamais execute)
-    // JMP retour -> hookSite+6
-    // --------------------------------------------------------
-    BYTE* s = stub;
+        *s++ = 0x50; // push eax
+        *s++ = 0x51; // push ecx
+        *s++ = 0x52; // push edx
+        *s++ = 0x56; // push esi
 
-    *s++ = 0x50; // push eax
-    *s++ = 0x51; // push ecx
-    *s++ = 0x52; // push edx
-    *s++ = 0x56; // push esi
+        *s++ = 0x57; // push edi   <- arg : TS_MESSAGE*
+        {
+            DWORD ct = (DWORD)(uintptr_t)V7PacketCallback;
+            DWORD cf = (DWORD)(uintptr_t)(s + 5);
+            *s++ = 0xE8;
+            *(DWORD*)s = ct - cf;
+            s += 4;
+        }
+        *s++ = 0x83; *s++ = 0xC4; *s++ = 0x04; // add esp,4  (cleanup 1 arg)
 
-    *s++ = 0x57; // push edi   <- arg : TS_MESSAGE*
-    {
-        DWORD ct = (DWORD)(uintptr_t)V7PacketCallback;
-        DWORD cf = (DWORD)(uintptr_t)(s + 5);
-        *s++ = 0xE8;
-        *(DWORD*)s = ct - cf;
+        *s++ = 0x5E; // pop esi
+        *s++ = 0x5A; // pop edx
+        *s++ = 0x59; // pop ecx
+        *s++ = 0x58; // pop eax
+
+        // Bytes voles (instructions completes) :
+        *s++ = 0x0F; *s++ = 0xB7; *s++ = 0x4F; *s++ = 0x04; // movzx ecx,[edi+4]
+        *s++ = 0x8B; *s++ = 0xC1;                             // mov eax,ecx
+
+        // JMP vers hookSite+6 (saute l'orphan byte 0xC1 a hookSite+5)
+        BYTE* jmpBack = hookSite + 6;
+        DWORD jmpRel  = (DWORD)(uintptr_t)jmpBack - (DWORD)(uintptr_t)(s + 5);
+        *s++ = 0xE9;
+        *(DWORD*)s = jmpRel;
         s += 4;
+
+        Log("Stub V7 %d bytes @ %p", (int)(s - stub), stub);
+
+        DWORD old = 0;
+        if (!VirtualProtect(hookSite, 5, PAGE_EXECUTE_READWRITE, &old)) {
+            Log("VirtualProtect V7 FAIL err=%lu", GetLastError());
+            VirtualFree(stub, 0, MEM_RELEASE);
+            return false;
+        }
+        DWORD rel = (DWORD)(uintptr_t)stub - (DWORD)(uintptr_t)(hookSite + 5);
+        hookSite[0] = 0xE9;
+        *(DWORD*)(hookSite + 1) = rel;
+        FlushInstructionCache(GetCurrentProcess(), hookSite, 5);
+        VirtualProtect(hookSite, 5, old, &old);
+
+        g_netHook.pSite     = hookSite;
+        g_netHook.pStub     = stub;
+        g_netHook.installed = true;
+        g_netHook.kind      = NET_HOOK_V7;
+        Log("Hook reseau V7 OK : site=%p stub=%p", hookSite, stub);
+        return true;
     }
-    *s++ = 0x83; *s++ = 0xC4; *s++ = 0x04; // add esp,4  (cleanup 1 arg)
 
-    *s++ = 0x5E; // pop esi
-    *s++ = 0x5A; // pop edx
-    *s++ = 0x59; // pop ecx
-    *s++ = 0x58; // pop eax
+    // --- Tentative 3 : client 6.3 ---
+    patAddr = ScanPattern(NET_HOOK_PATTERN_63, sizeof(NET_HOOK_PATTERN_63));
+    if (patAddr)
+    {
+        BYTE* hookSite = (BYTE*)patAddr + NET_HOOK_OFFSET_63;
+        Log("Pattern 6.3 @ %p, hookSite @ %p", patAddr, hookSite);
 
-    // Bytes voles (instructions completes) :
-    *s++ = 0x0F; *s++ = 0xB7; *s++ = 0x4F; *s++ = 0x04; // movzx ecx,[edi+4]
-    *s++ = 0x8B; *s++ = 0xC1;                             // mov eax,ecx
+        BYTE* stub = (BYTE*)VirtualAlloc(nullptr, 128,
+                         MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!stub) { Log("VirtualAlloc stub 6.3 FAIL err=%lu", GetLastError()); return false; }
 
-    // JMP vers hookSite+6 (saute l'orphan byte 0xC1 a hookSite+5)
-    BYTE* jmpBack = hookSite + 6;
-    DWORD jmpRel  = (DWORD)(uintptr_t)jmpBack - (DWORD)(uintptr_t)(s + 5);
-    *s++ = 0xE9;
-    *(DWORD*)s = jmpRel;
-    s += 4;
+        // --------------------------------------------------------
+        // Stub 6.3
+        // Entree via JMP : ebp = TS_MESSAGE* (packet complet, valide)
+        // Bytes voles (6) : 0F B7 4D 04 (movzx ecx,[ebp+4]) + 8B C1
+        // --------------------------------------------------------
+        BYTE* s = stub;
 
-    Log("Stub V7 %d bytes @ %p", (int)(s - stub), stub);
+        *s++ = 0x50; // push eax
+        *s++ = 0x51; // push ecx
+        *s++ = 0x52; // push edx
+        *s++ = 0x56; // push esi
 
-    DWORD old = 0;
-    if (!VirtualProtect(hookSite, 5, PAGE_EXECUTE_READWRITE, &old)) {
-        Log("VirtualProtect V7 FAIL err=%lu", GetLastError());
-        VirtualFree(stub, 0, MEM_RELEASE);
-        return false;
+        *s++ = 0x55; // push ebp   <- arg : TS_MESSAGE*
+        {
+            DWORD ct = (DWORD)(uintptr_t)V7PacketCallback;
+            DWORD cf = (DWORD)(uintptr_t)(s + 5);
+            *s++ = 0xE8;
+            *(DWORD*)s = ct - cf;
+            s += 4;
+        }
+        *s++ = 0x83; *s++ = 0xC4; *s++ = 0x04; // add esp,4
+
+        *s++ = 0x5E; // pop esi
+        *s++ = 0x5A; // pop edx
+        *s++ = 0x59; // pop ecx
+        *s++ = 0x58; // pop eax
+
+        *s++ = 0x0F; *s++ = 0xB7; *s++ = 0x4D; *s++ = 0x04; // movzx ecx,[ebp+4]
+        *s++ = 0x8B; *s++ = 0xC1;                             // mov eax,ecx
+
+        BYTE* jmpBack = hookSite + 6;
+        DWORD jmpRel  = (DWORD)(uintptr_t)jmpBack - (DWORD)(uintptr_t)(s + 5);
+        *s++ = 0xE9;
+        *(DWORD*)s = jmpRel;
+        s += 4;
+
+        Log("Stub 6.3 %d bytes @ %p", (int)(s - stub), stub);
+
+        DWORD old = 0;
+        if (!VirtualProtect(hookSite, 5, PAGE_EXECUTE_READWRITE, &old)) {
+            Log("VirtualProtect 6.3 FAIL err=%lu", GetLastError());
+            VirtualFree(stub, 0, MEM_RELEASE);
+            return false;
+        }
+        DWORD rel = (DWORD)(uintptr_t)stub - (DWORD)(uintptr_t)(hookSite + 5);
+        hookSite[0] = 0xE9;
+        *(DWORD*)(hookSite + 1) = rel;
+        FlushInstructionCache(GetCurrentProcess(), hookSite, 5);
+        VirtualProtect(hookSite, 5, old, &old);
+
+        g_netHook.pSite     = hookSite;
+        g_netHook.pStub     = stub;
+        g_netHook.installed = true;
+        g_netHook.kind      = NET_HOOK_63;
+        Log("Hook reseau 6.3 OK : site=%p stub=%p", hookSite, stub);
+        return true;
     }
-    DWORD rel = (DWORD)(uintptr_t)stub - (DWORD)(uintptr_t)(hookSite + 5);
-    hookSite[0] = 0xE9;
-    *(DWORD*)(hookSite + 1) = rel;
-    FlushInstructionCache(GetCurrentProcess(), hookSite, 5);
-    VirtualProtect(hookSite, 5, old, &old);
 
-    g_netHook.pSite     = hookSite;
-    g_netHook.pStub     = stub;
-    g_netHook.installed = true;
-    g_netHook.isV7      = true;
-    Log("Hook reseau V7 OK : site=%p stub=%p", hookSite, stub);
-    return true;
+    Log("NET_HOOK_PATTERN_V7 / NET_HOOK_PATTERN_63 introuvables");
+    return false;
 }
 
 static void RemoveNetworkHook()
 {
     if (!g_netHook.installed) return;
     BYTE kOrig[5];
-    if (g_netHook.isV7)
+    if (g_netHook.kind == NET_HOOK_V7)
     {   // movzx ecx,[edi+4] (4 bytes) + premier byte de mov eax,ecx (1 byte)
         kOrig[0]=0x0F; kOrig[1]=0xB7; kOrig[2]=0x4F; kOrig[3]=0x04; kOrig[4]=0x8B;
+    }
+    else if (g_netHook.kind == NET_HOOK_63)
+    {   // movzx ecx,[ebp+4] (4 bytes) + premier byte de mov eax,ecx (1 byte)
+        kOrig[0]=0x0F; kOrig[1]=0xB7; kOrig[2]=0x4D; kOrig[3]=0x04; kOrig[4]=0x8B;
     }
     else
     {   // push ecx + mov ecx,esi + call edx (5 bytes)
@@ -2000,8 +2228,9 @@ static void DrawDPSPanel(IDirect3DDevice9* dev)
         static DWORD s_lastScanRetry = 0;
         if (g_localHandle && !g_localNameCache[0] && now - s_lastScanRetry > 5000) {
             s_lastScanRetry = now;
-            CloseHandle(CreateThread(nullptr, 0, ScanNameByHandleThread,
-                                     (LPVOID)(uintptr_t)(unsigned int)g_localHandle, 0, nullptr));
+            if (TryQueueNameScan(g_localHandle))
+                CloseHandle(CreateThread(nullptr, 0, ScanNameByHandleThread,
+                                         (LPVOID)(uintptr_t)(unsigned int)g_localHandle, 0, nullptr));
         }
     }
 
@@ -2360,18 +2589,30 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
         StreamCS_Init();
         EntCS_Init();
         StatsCS_Init();
+        NameScanCS_Init();
         memset(g_entities,0,sizeof(g_entities));
         memset(g_combat,  0,sizeof(g_combat));
-        // Detecter la version du client selon la taille du module :
-        //   SFrame.exe  (~9.9 MB, 17 elem) : g_clientV7 = false
-        //   Sframe.exe  (~8.9 MB,  7 elem) : g_clientV7 = true
-        // GetModuleHandleA est case-insensitive sur Windows, trouve les deux noms.
+        // Detecter le type de client en priorisant les signatures reseau.
+        // Fallback taille: historique (<9 MB = V7, ~9.9 MB = ancien, >=12 MB = 6.3 observe).
         {
             HMODULE hSFr = GetModuleHandleA("SFrame.exe");
             if (hSFr) {
                 MODULEINFO mi = {};
                 GetModuleInformation(GetCurrentProcess(), hSFr, &mi, sizeof(mi));
-                g_clientV7 = (mi.SizeOfImage < 9000000u);
+                const bool hasOld = (ScanPattern(NET_HOOK_PATTERN, sizeof(NET_HOOK_PATTERN)) != nullptr);
+                const bool hasV7  = (ScanPattern(NET_HOOK_PATTERN_V7, sizeof(NET_HOOK_PATTERN_V7)) != nullptr);
+                const bool has63  = (ScanPattern(NET_HOOK_PATTERN_63, sizeof(NET_HOOK_PATTERN_63)) != nullptr);
+
+                if (hasOld) g_clientV7 = false;
+                else if (hasV7 || has63) g_clientV7 = true;
+                else g_clientV7 = (mi.SizeOfImage < 9000000u) || (mi.SizeOfImage >= 12000000u);
+
+                Log("Client detect: size=%lu old=%d v7=%d v63=%d => g_clientV7=%d",
+                    (unsigned long)mi.SizeOfImage,
+                    hasOld ? 1 : 0,
+                    hasV7 ? 1 : 0,
+                    has63 ? 1 : 0,
+                    g_clientV7 ? 1 : 0);
             }
         }
         ReadLocalPlayerFromMemory(); // lit le nom local depuis la memoire statique de SFrame.exe
