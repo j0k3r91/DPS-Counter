@@ -2701,19 +2701,23 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
                 const bool hasOld = (ScanPattern(NET_HOOK_PATTERN, sizeof(NET_HOOK_PATTERN)) != nullptr);
                 const bool hasV7  = (ScanPattern(NET_HOOK_PATTERN_V7, sizeof(NET_HOOK_PATTERN_V7)) != nullptr);
                 const bool has63  = (ScanPattern(NET_HOOK_PATTERN_63, sizeof(NET_HOOK_PATTERN_63)) != nullptr);
+                const bool hasRC  = (ScanPattern(NET_HOOK_PATTERN_RC, sizeof(NET_HOOK_PATTERN_RC)) != nullptr);
 
+                // hasOld → 17 elementaux, layout standard
+                // hasV7/has63/hasRC → 7 elementaux (RappelzClassic ~10.1 MB aussi en 7 elem)
                 if (hasOld) g_clientV7 = false;
-                else if (hasV7 || has63) g_clientV7 = true;
+                else if (hasV7 || has63 || hasRC) g_clientV7 = true;
                 else g_clientV7 = (mi.SizeOfImage < 9000000u) || (mi.SizeOfImage >= 12000000u);
 
-                // Format 12.6 MB+ : skill_id 3 bytes, skill_level supprime
+                // Format 12.6 MB+ uniquement : skill_id 3 bytes, skill_level supprime
                 g_clientShiftedSkill = has63 || (mi.SizeOfImage >= 12000000u);
 
-                Log("Client detect: size=%lu old=%d v7=%d v63=%d => g_clientV7=%d shiftedSkill=%d",
+                Log("Client detect: size=%lu old=%d v7=%d v63=%d rc=%d => g_clientV7=%d shiftedSkill=%d",
                     (unsigned long)mi.SizeOfImage,
                     hasOld ? 1 : 0,
                     hasV7 ? 1 : 0,
                     has63 ? 1 : 0,
+                    hasRC ? 1 : 0,
                     g_clientV7 ? 1 : 0,
                     g_clientShiftedSkill ? 1 : 0);
             }
