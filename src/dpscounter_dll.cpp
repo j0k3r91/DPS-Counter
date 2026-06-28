@@ -2723,8 +2723,8 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
                 else if (hasV7 || has63 || hasRC) g_clientV7 = true;
                 else g_clientV7 = (mi.SizeOfImage < 9000000u) || (mi.SizeOfImage >= 12000000u);
 
-                // Format 12.6 MB+ uniquement : skill_id 3 bytes, skill_level supprime
-                g_clientShiftedSkill = has63 || (mi.SizeOfImage >= 12000000u);
+                // Format 12.6 MB+ ET RappelzClassic (~10.1 MB) : skill_id 3 bytes, skill_level supprime
+                g_clientShiftedSkill = has63 || hasRC || (mi.SizeOfImage >= 12000000u);
 
                 Log("Client detect: size=%lu old=%d v7=%d v63=%d rc=%d => g_clientV7=%d shiftedSkill=%d",
                     (unsigned long)mi.SizeOfImage,
