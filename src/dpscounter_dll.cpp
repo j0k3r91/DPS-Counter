@@ -1118,6 +1118,16 @@ static void ParseSkill(const unsigned char* p, unsigned int sz)
     unsigned int  caster = ReadU32(p + (g_clientShiftedSkill ? 10 : 12));
     unsigned char type   = p[g_clientShiftedSkill ? 31 : 33];
 
+    // Diagnostic: dump des offsets cles pour identifier le bon layout
+    {
+        unsigned int c10 = ReadU32(p+10), c11=ReadU32(p+11), c12=ReadU32(p+12);
+        unsigned short cnt55=ReadU16(p+55), cnt56=ReadU16(p+56), cnt57=ReadU16(p+57);
+        Log("SKILL_DIAG: sz=%u shifted=%d c10=0x%08X c11=0x%08X c12=0x%08X cnt55=%u cnt56=%u cnt57=%u",
+            sz, (int)g_clientShiftedSkill, c10, c11, c12, (unsigned)cnt55, (unsigned)cnt56, (unsigned)cnt57);
+        Log("SKILL_DIAG: type33=%d type32=%d type31=%d hdrSz=%u cntOff=%u",
+            (int)p[33], (int)p[32], (int)p[31], hdrSz, cntOff);
+    }
+
     static const unsigned char FIRE           = 0;
     static const unsigned char CASTING        = 1;
     static const unsigned char CASTING_UPDATE = 2;
@@ -1142,8 +1152,12 @@ static void ParseSkill(const unsigned char* p, unsigned int sz)
     }
 
     unsigned short srCount = ReadU16(p + cntOff);
-    if (srCount == 0 || srCount > 256) return;
-    Log("SKILL: caster=%u type=%d srCount=%d isPlayer=%d", caster, (int)type, (int)srCount, (int)IsPlayerEntity(caster));
+    if (srCount == 0 || srCount > 256) {
+        Log("SKILL: srCount=%u out of range (cntOff=%u) — returning", (unsigned)srCount, cntOff);
+        return;
+    }
+    Log("SKILL: caster=%u type=%d srCount=%d isPlayer=%d hdrSz=%u remaining=%u",
+        caster, (int)type, (int)srCount, (int)IsPlayerEntity(caster), hdrSz, sz - hdrSz);
 
     const unsigned char* sr = p + hdrSz;
     unsigned int remaining  = sz - hdrSz;
