@@ -1841,8 +1841,8 @@ static bool InstallNetworkHook()
         // Stub RC (RappelzClassic 10.1 MB)
         // Entree via JMP : edi = TS_MESSAGE* (packet complet, valide)
         // Meme principe que V7 : on appelle V7PacketCallback(edi)
-        // Bytes voles (4) : 0F B7 4F 04 (movzx ecx,[edi+4])
-        // JMP retour -> hookSite+4
+        // Bytes voles (6) : 0F B7 4F 04 (movzx ecx,[edi+4]) + 8B C1 (mov eax,ecx)
+        // JMP retour -> hookSite+6 (saute l'orphan byte 0xC1 a hookSite+5)
         // --------------------------------------------------------
         BYTE* s = stub;
 
@@ -1866,11 +1866,12 @@ static bool InstallNetworkHook()
         *s++ = 0x59; // pop ecx
         *s++ = 0x58; // pop eax
 
-        // Bytes voles :
+        // Bytes voles (instructions completes) :
         *s++ = 0x0F; *s++ = 0xB7; *s++ = 0x4F; *s++ = 0x04; // movzx ecx,[edi+4]
+        *s++ = 0x8B; *s++ = 0xC1;                             // mov eax,ecx
 
-        // JMP vers hookSite+4
-        BYTE* jmpBack = hookSite + 4;
+        // JMP vers hookSite+6 (saute l'orphan byte a hookSite+5)
+        BYTE* jmpBack = hookSite + 6;
         DWORD jmpRel  = (DWORD)(uintptr_t)jmpBack - (DWORD)(uintptr_t)(s + 5);
         *s++ = 0xE9;
         *(DWORD*)s = jmpRel;
