@@ -91,7 +91,21 @@ Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/).
 
 ---
 
-## [Unreleased]
+## [1.1.2] — 2026-06-09
+
+### Corrections
+
+- **Relancement robuste** : si une instance précédente du DPS meter est encore active,
+  elle est fermée automatiquement avant nouveau chargement.
+- **Stabilité des timers par onglet** : les timers DPS/Heal/Tank sont désormais
+  indépendants par onglet, avec reprise/gel cohérents selon l'activité.
+- **Molette limitée au panneau** : le scroll du DPS meter ne s'applique plus si le
+  curseur n'est pas sur la fenêtre/panneau du compteur, tout en laissant la molette
+  fonctionner normalement dans le jeu.
+
+---
+
+## [1.1.3-RappelzClassic] — 2026-06-14
 
 ### Ajouté
 
@@ -106,14 +120,19 @@ Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/).
 
 ---
 
-## [1.1.2] — 2026-06-09
+## [1.1.4-RappelzClassic] — 2026-06-28
 
-### Corrections
+### Ajouté
 
-- **Relancement robuste** : si une instance précédente du DPS meter est encore active,
-  elle est fermée automatiquement avant nouveau chargement.
-- **Stabilité des timers par onglet** : les timers DPS/Heal/Tank sont désormais
-  indépendants par onglet, avec reprise/gel cohérents selon l'activité.
-- **Molette limitée au panneau** : le scroll du DPS meter ne s'applique plus si le
-  curseur n'est pas sur la fenêtre/panneau du compteur, tout en laissant la molette
-  fonctionner normalement dans le jeu.
+- **Support client 12.6 MB (v2026)** : adaptation du layout `TS_SC_SKILL` pour les
+  clients récents où `skill_id` passe de 4→3 octets et `skill_level` est supprimé
+  (shift de -2 octets sur tous les offsets de la structure).
+- **Détection handle local universelle** : la détection du joueur local depuis le
+  premier paquet d'attaque/skill n'est plus conditionnée à `g_clientV7`, ce qui
+  permet de supporter tout client sans RVA statiques valides.
+
+### Technique
+
+- Debug : activation de `DPS_DEBUG` pour les dumps hexa des paquets bruts.
+- Correction des offsets dans `DispatchPacket` (debug log `RAWSKILL`) pour le
+  nouveau format client.
