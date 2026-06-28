@@ -156,6 +156,8 @@ static const unsigned char SR_CHAIN_HEAL   = 42;
 //   < 9 000 000 bytes (~8.5 MB) --> Sframe.exe nouveau client (7 types elementaux)
 //   >= 9 000 000 bytes (~9.5 MB) --> SFrame.exe ancien client (17 types elementaux)
 static bool g_clientV7 = false;
+// 12.6 MB+ clients : skill_id passe de 4→3 bytes, skill_level supprime (shift -2)
+static bool g_clientShiftedSkill = false;
 
 // Declarations avancees (defini plus bas dans le fichier)
 static HMODULE g_hMod = nullptr;  // initialise dans DllMain
@@ -1100,18 +1102,21 @@ static void ParseAttackEvent(const unsigned char* p, unsigned int sz)
 
 static void ParseSkill(const unsigned char* p, unsigned int sz)
 {
-    // Layout TS_SC_SKILL (packet 1) — MIS A JOUR pour client 12.6 MB (v2026)
-    //   skill_id passe de 4→3 bytes, skill_level supprime → tout shift -2 bytes :
-    //   TS_MSG(7) + skill_id(3) + caster(4) + target(4) + xyz(12) + layer(1) + type(1)
-    //   + hp_cost(4) + mp_cost(4) + caster_hp(4) + caster_mp(4) = 48 octets (static)
-    //   + FireType (9 octets, inchange) = 57 minimum
-    //   srCount a p+55, SR data a p+57
-    const unsigned int hdrSz    = 57u;
-    const unsigned int cntOff   = 55u;
+    // Layout TS_SC_SKILL (packet 1) :
+    //   Standard (V7, ancien, RappelzClassic) :
+    //     TS_MSG(7) + skill_id(4) + skill_level(1) + caster(4) + target(4) + xyz(12)
+    //     + layer(1) + type(1) + hp_cost(4) + mp_cost(4) + caster_hp(4) + caster_mp(4)
+    //     = 50 octets (static) + FireType (9) = 59 minimum
+    //     srCount a p+57, SR data a p+59, caster a p+12, type a p+33
+    //   12.6 MB+ (g_clientShiftedSkill) :
+    //     skill_id 4→3 bytes, skill_level supprime → shift -2 bytes
+    //     srCount a p+55, SR data a p+57, caster a p+10, type a p+31
+    const unsigned int hdrSz    = g_clientShiftedSkill ? 57u : 59u;
+    const unsigned int cntOff   = g_clientShiftedSkill ? 55u : 57u;
 
     if (sz < hdrSz) return;
-    unsigned int  caster = ReadU32(p + 10);   // etait p+12, shift -2 (skill_id 3 bytes, skill_level removed)
-    unsigned char type   = p[31];              // etait p[33], shift -2
+    unsigned int  caster = ReadU32(p + (g_clientShiftedSkill ? 10 : 12));
+    unsigned char type   = p[g_clientShiftedSkill ? 31 : 33];
 
     static const unsigned char FIRE           = 0;
     static const unsigned char CASTING        = 1;
@@ -1359,10 +1364,10 @@ static void DispatchPacket(const unsigned char* p, unsigned int sz)
             for (int _i = 0; _i < dump && hx < 500; ++_i)
                 hx += snprintf(hex+hx, 510-hx, "%02X ", p[_i]);
             {
-                unsigned int _cntOff = 55u;    // nouveau client 12.6MB: count FireType retiré
-                unsigned int _minSz  = 57u;    // hdrSz minimum
+                unsigned int _cntOff = g_clientShiftedSkill ? 55u : 57u;
+                unsigned int _minSz  = g_clientShiftedSkill ? 57u : 59u;
                 Log("RAWSKILL type=%d sz=%u srCount=%u hex: %s",
-                    (int)p[31], sz, (sz>=_minSz?ReadU16(p+_cntOff):0), hex);
+                    (int)(g_clientShiftedSkill ? p[31] : p[33]), sz, (sz>=_minSz?ReadU16(p+_cntOff):0), hex);
             }
         }
 #endif
@@ -1565,11 +1570,26 @@ static const unsigned char NET_HOOK_PATTERN_63[] = {
 };
 static const int NET_HOOK_OFFSET_63 = 9;
 
+// RappelzClassic / client 10.1 MB (Rappelz Classic) :
+//   cmp esi,eax ; ja erreur ; movzx ecx,[edi+4]
+// Dispatch via jump table 2 niveaux (0-0xFA et 0xFF-0x1F4).
+// Hook site = offset 0 (sur movzx ecx,[edi+4])
+// Bytes voles (4) : 0F B7 4F 04  (movzx ecx,[edi+4])
+// JMP retour -> hookSite+4
+// Pattern 12 octets sans offsets relatifs - stable entre builds.
+static const unsigned char NET_HOOK_PATTERN_RC[] = {
+    0x0F, 0xB7, 0x4F, 0x04,              // movzx ecx,word ptr [edi+04]  <- hook ici
+    0x8B, 0xC1,                           // mov eax,ecx
+    0x81, 0xF9, 0xFE, 0x00, 0x00, 0x00  // cmp ecx,000000FE
+};
+static const int NET_HOOK_OFFSET_RC = 0; // hook sur le 1er byte du pattern
+
 enum NetHookKind {
     NET_HOOK_NONE = 0,
     NET_HOOK_OLD  = 1,
     NET_HOOK_V7   = 2,
-    NET_HOOK_63   = 3
+    NET_HOOK_63   = 3,
+    NET_HOOK_RC   = 4
 };
 
 struct JmpHook { void* pSite; void* pStub; bool installed; int kind; };
@@ -1806,7 +1826,79 @@ static bool InstallNetworkHook()
         return true;
     }
 
-    Log("NET_HOOK_PATTERN_V7 / NET_HOOK_PATTERN_63 introuvables");
+    // --- Tentative 4 : RappelzClassic (~10.1 MB) ---
+    patAddr = ScanPattern(NET_HOOK_PATTERN_RC, sizeof(NET_HOOK_PATTERN_RC));
+    if (patAddr)
+    {
+        BYTE* hookSite = (BYTE*)patAddr + NET_HOOK_OFFSET_RC;
+        Log("Pattern RC @ %p, hookSite @ %p", patAddr, hookSite);
+
+        BYTE* stub = (BYTE*)VirtualAlloc(nullptr, 128,
+                         MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!stub) { Log("VirtualAlloc stub RC FAIL err=%lu", GetLastError()); return false; }
+
+        // --------------------------------------------------------
+        // Stub RC (RappelzClassic 10.1 MB)
+        // Entree via JMP : edi = TS_MESSAGE* (packet complet, valide)
+        // Meme principe que V7 : on appelle V7PacketCallback(edi)
+        // Bytes voles (4) : 0F B7 4F 04 (movzx ecx,[edi+4])
+        // JMP retour -> hookSite+4
+        // --------------------------------------------------------
+        BYTE* s = stub;
+
+        *s++ = 0x50; // push eax
+        *s++ = 0x51; // push ecx
+        *s++ = 0x52; // push edx
+        *s++ = 0x56; // push esi
+
+        *s++ = 0x57; // push edi   <- arg : TS_MESSAGE*
+        {
+            DWORD ct = (DWORD)(uintptr_t)V7PacketCallback;
+            DWORD cf = (DWORD)(uintptr_t)(s + 5);
+            *s++ = 0xE8;
+            *(DWORD*)s = ct - cf;
+            s += 4;
+        }
+        *s++ = 0x83; *s++ = 0xC4; *s++ = 0x04; // add esp,4
+
+        *s++ = 0x5E; // pop esi
+        *s++ = 0x5A; // pop edx
+        *s++ = 0x59; // pop ecx
+        *s++ = 0x58; // pop eax
+
+        // Bytes voles :
+        *s++ = 0x0F; *s++ = 0xB7; *s++ = 0x4F; *s++ = 0x04; // movzx ecx,[edi+4]
+
+        // JMP vers hookSite+4
+        BYTE* jmpBack = hookSite + 4;
+        DWORD jmpRel  = (DWORD)(uintptr_t)jmpBack - (DWORD)(uintptr_t)(s + 5);
+        *s++ = 0xE9;
+        *(DWORD*)s = jmpRel;
+        s += 4;
+
+        Log("Stub RC %d bytes @ %p", (int)(s - stub), stub);
+
+        DWORD old = 0;
+        if (!VirtualProtect(hookSite, 5, PAGE_EXECUTE_READWRITE, &old)) {
+            Log("VirtualProtect RC FAIL err=%lu", GetLastError());
+            VirtualFree(stub, 0, MEM_RELEASE);
+            return false;
+        }
+        DWORD rel = (DWORD)(uintptr_t)stub - (DWORD)(uintptr_t)(hookSite + 5);
+        hookSite[0] = 0xE9;
+        *(DWORD*)(hookSite + 1) = rel;
+        FlushInstructionCache(GetCurrentProcess(), hookSite, 5);
+        VirtualProtect(hookSite, 5, old, &old);
+
+        g_netHook.pSite     = hookSite;
+        g_netHook.pStub     = stub;
+        g_netHook.installed = true;
+        g_netHook.kind      = NET_HOOK_RC;
+        Log("Hook reseau RC OK : site=%p stub=%p", hookSite, stub);
+        return true;
+    }
+
+    Log("Aucun pattern de hook reseau trouve (OLD/V7/63/RC)");
     return false;
 }
 
@@ -1814,7 +1906,7 @@ static void RemoveNetworkHook()
 {
     if (!g_netHook.installed) return;
     BYTE kOrig[5];
-    if (g_netHook.kind == NET_HOOK_V7)
+    if (g_netHook.kind == NET_HOOK_V7 || g_netHook.kind == NET_HOOK_RC)
     {   // movzx ecx,[edi+4] (4 bytes) + premier byte de mov eax,ecx (1 byte)
         kOrig[0]=0x0F; kOrig[1]=0xB7; kOrig[2]=0x4F; kOrig[3]=0x04; kOrig[4]=0x8B;
     }
@@ -2613,12 +2705,16 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
                 else if (hasV7 || has63) g_clientV7 = true;
                 else g_clientV7 = (mi.SizeOfImage < 9000000u) || (mi.SizeOfImage >= 12000000u);
 
-                Log("Client detect: size=%lu old=%d v7=%d v63=%d => g_clientV7=%d",
+                // Format 12.6 MB+ : skill_id 3 bytes, skill_level supprime
+                g_clientShiftedSkill = has63 || (mi.SizeOfImage >= 12000000u);
+
+                Log("Client detect: size=%lu old=%d v7=%d v63=%d => g_clientV7=%d shiftedSkill=%d",
                     (unsigned long)mi.SizeOfImage,
                     hasOld ? 1 : 0,
                     hasV7 ? 1 : 0,
                     has63 ? 1 : 0,
-                    g_clientV7 ? 1 : 0);
+                    g_clientV7 ? 1 : 0,
+                    g_clientShiftedSkill ? 1 : 0);
             }
         }
         ReadLocalPlayerFromMemory(); // lit le nom local depuis la memoire statique de SFrame.exe
