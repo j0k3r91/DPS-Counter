@@ -53,6 +53,11 @@
 #pragma comment(lib, "psapi.lib")
 
 // ============================================================
+// DEBUG: active les dumps hexa des paquets bruts (desactiver en release)
+// ============================================================
+#define DPS_DEBUG
+
+// ============================================================
 // Logger
 // ============================================================
 static CRITICAL_SECTION g_logCS;
@@ -1062,9 +1067,10 @@ static void ParseAttackEvent(const unsigned char* p, unsigned int sz)
     }
 #endif
 
-    // V7 : OPC1000 (TM_SC_RESULT) n'existe pas — detecter le joueur local
-    // depuis le premier paquet d'attaque recue. 0x8... = joueur, 0xC... = pet.
-    if (g_clientV7 && g_localHandle == 0 &&
+    // Detecter le joueur local depuis le premier paquet d'attaque recu
+    // (necessaire sur V7 et tout client sans static RVAs valides).
+    // 0x8... = joueur, 0xC... = pet.
+    if (g_localHandle == 0 &&
         attacker != 0 && (attacker & 0xC0000000) == 0x80000000)
     {
         g_localHandle = attacker;
@@ -1094,19 +1100,18 @@ static void ParseAttackEvent(const unsigned char* p, unsigned int sz)
 
 static void ParseSkill(const unsigned char* p, unsigned int sz)
 {
-    // Layout TS_SC_SKILL (pack 1) :
-    //   TS_MSG(7) + skill_id(4) + skill_level(1) + caster(4) + target(4) + xyz(12) + layer(1) + type(1)
-    //   + hp_cost(4) + mp_cost(4) + caster_hp(4) + caster_mp(4) = 50 octets (static)
-    //   + FireType : bMultiple(1)+range(4)+target_count(1)+fire_count(1)+count(2) = 9 octets
-    //   La structure TS_SC_SKILL est identique en V7 et non-V7 :
-    //     srCount a p+57, SR data a p+59, taille min = 59 (FIRE sans SR)
-    //   Seule la taille de chaque SkillResult change (V7=32, non-V7=52 octets).
-    const unsigned int hdrSz    = 59u;
-    const unsigned int cntOff   = 57u;
+    // Layout TS_SC_SKILL (packet 1) — MIS A JOUR pour client 12.6 MB (v2026)
+    //   skill_id passe de 4→3 bytes, skill_level supprime → tout shift -2 bytes :
+    //   TS_MSG(7) + skill_id(3) + caster(4) + target(4) + xyz(12) + layer(1) + type(1)
+    //   + hp_cost(4) + mp_cost(4) + caster_hp(4) + caster_mp(4) = 48 octets (static)
+    //   + FireType (9 octets, inchange) = 57 minimum
+    //   srCount a p+55, SR data a p+57
+    const unsigned int hdrSz    = 57u;
+    const unsigned int cntOff   = 55u;
 
     if (sz < hdrSz) return;
-    unsigned int  caster = ReadU32(p + 12);
-    unsigned char type   = p[33];
+    unsigned int  caster = ReadU32(p + 10);   // etait p+12, shift -2 (skill_id 3 bytes, skill_level removed)
+    unsigned char type   = p[31];              // etait p[33], shift -2
 
     static const unsigned char FIRE           = 0;
     static const unsigned char CASTING        = 1;
@@ -1114,8 +1119,9 @@ static void ParseSkill(const unsigned char* p, unsigned int sz)
     static const unsigned char CANCEL         = 3;
     static const unsigned char REGION_FIRE    = 4;
     static const unsigned char COMPLETE       = 5;
-    // V7 : meme detection que ParseAttackEvent
-    if (g_clientV7 && g_localHandle == 0 &&
+    // Detecter le joueur local depuis le premier paquet de skill recu
+    // (necessaire sur V7 et tout client sans static RVAs valides).
+    if (g_localHandle == 0 &&
         caster != 0 && (caster & 0xC0000000) == 0x80000000)
     {
         g_localHandle = caster;
@@ -1353,10 +1359,10 @@ static void DispatchPacket(const unsigned char* p, unsigned int sz)
             for (int _i = 0; _i < dump && hx < 500; ++_i)
                 hx += snprintf(hex+hx, 510-hx, "%02X ", p[_i]);
             {
-                unsigned int _cntOff = g_clientV7 ? 59u : 57u;
-                unsigned int _minSz  = g_clientV7 ? 61u : 59u;
+                unsigned int _cntOff = 55u;    // nouveau client 12.6MB: count FireType retiré
+                unsigned int _minSz  = 57u;    // hdrSz minimum
                 Log("RAWSKILL type=%d sz=%u srCount=%u hex: %s",
-                    (int)p[33], sz, (sz>=_minSz?ReadU16(p+_cntOff):0), hex);
+                    (int)p[31], sz, (sz>=_minSz?ReadU16(p+_cntOff):0), hex);
             }
         }
 #endif
