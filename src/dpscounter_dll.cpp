@@ -1610,61 +1610,62 @@ extern "C" void __cdecl V7PacketCallback(const unsigned char* pkt)
 
 static bool InstallNetworkHook()
 {
-    // --- Tentative 1 : ancien client (SFrame.exe 17-elem) ---
-    void* patAddr = ScanPattern(NET_HOOK_PATTERN, sizeof(NET_HOOK_PATTERN));
+    // --- Tentative 1 : RappelzClassic (~10.1 MB) — pattern le plus specifique ---
+    void* patAddr = ScanPattern(NET_HOOK_PATTERN_RC, sizeof(NET_HOOK_PATTERN_RC));
     if (patAddr)
     {
-        BYTE* hookSite = (BYTE*)patAddr + NET_HOOK_OFFSET;
-        Log("Pattern ancien client @ %p, hookSite @ %p", patAddr, hookSite);
+        BYTE* hookSite = (BYTE*)patAddr + NET_HOOK_OFFSET_RC;
+        Log("Pattern RC @ %p, hookSite @ %p", patAddr, hookSite);
 
         BYTE* stub = (BYTE*)VirtualAlloc(nullptr, 128,
                          MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-        if (!stub) { Log("VirtualAlloc stub FAIL err=%lu", GetLastError()); return false; }
+        if (!stub) { Log("VirtualAlloc stub RC FAIL err=%lu", GetLastError()); return false; }
 
         // --------------------------------------------------------
-        // Stub ancien client
-        // Entree via JMP : ecx=buf, [esp+0]=size, esi=disp, edx=OnRecv
+        // Stub RC (RappelzClassic 10.1 MB)
+        // Entree via JMP : edi = TS_MESSAGE* (packet complet, valide)
+        // Meme principe que V7 : on appelle V7PacketCallback(edi)
+        // Bytes voles (6) : 0F B7 4F 04 (movzx ecx,[edi+4]) + 8B C1 (mov eax,ecx)
+        // JMP retour -> hookSite+6 (saute l'orphan byte 0xC1 a hookSite+5)
         // --------------------------------------------------------
         BYTE* s = stub;
 
-        *s++ = 0x50;  // push eax
-        *s++ = 0x51;  // push ecx  (buf_ptr)
-        *s++ = 0x52;  // push edx  (OnRecv fn)
-        *s++ = 0x56;  // push esi  (dispatcher)
-        // [esp]=esi [esp+4]=edx [esp+8]=buf [esp+12]=eax [esp+16]=size
+        *s++ = 0x50; // push eax
+        *s++ = 0x51; // push ecx
+        *s++ = 0x52; // push edx
+        *s++ = 0x56; // push esi
 
-        *s++ = 0xFF; *s++ = 0x74; *s++ = 0x24; *s++ = 0x10; // push size [esp+16]
-        *s++ = 0xFF; *s++ = 0x74; *s++ = 0x24; *s++ = 0x0C; // push buf  [esp+12]
+        *s++ = 0x57; // push edi   <- arg : TS_MESSAGE*
+        {
+            DWORD ct = (DWORD)(uintptr_t)V7PacketCallback;
+            DWORD cf = (DWORD)(uintptr_t)(s + 5);
+            *s++ = 0xE8;
+            *(DWORD*)s = ct - cf;
+            s += 4;
+        }
+        *s++ = 0x83; *s++ = 0xC4; *s++ = 0x04; // add esp,4
 
-        DWORD callTarget = (DWORD)(uintptr_t)ProcessDecryptedBuffer;
-        DWORD callFrom   = (DWORD)(uintptr_t)(s + 5);
-        *s++ = 0xE8;
-        *(DWORD*)s = callTarget - callFrom;
-        s += 4;
-
-        *s++ = 0x83; *s++ = 0xC4; *s++ = 0x08; // add esp,8
         *s++ = 0x5E; // pop esi
         *s++ = 0x5A; // pop edx
         *s++ = 0x59; // pop ecx
         *s++ = 0x58; // pop eax
 
-        // Bytes voles : 51 8B CE FF D2
-        *s++ = 0x51;               // push ecx
-        *s++ = 0x8B; *s++ = 0xCE; // mov ecx, esi
-        *s++ = 0xFF; *s++ = 0xD2; // call edx
+        // Bytes voles (instructions completes) :
+        *s++ = 0x0F; *s++ = 0xB7; *s++ = 0x4F; *s++ = 0x04; // movzx ecx,[edi+4]
+        *s++ = 0x8B; *s++ = 0xC1;                             // mov eax,ecx
 
-        // JMP vers hookSite+5
-        BYTE* jmpBack = hookSite + 5;
+        // JMP vers hookSite+6 (saute l'orphan byte a hookSite+5)
+        BYTE* jmpBack = hookSite + 6;
         DWORD jmpRel  = (DWORD)(uintptr_t)jmpBack - (DWORD)(uintptr_t)(s + 5);
         *s++ = 0xE9;
         *(DWORD*)s = jmpRel;
         s += 4;
 
-        Log("Stub ancien %d bytes @ %p", (int)(s - stub), stub);
+        Log("Stub RC %d bytes @ %p", (int)(s - stub), stub);
 
         DWORD old = 0;
         if (!VirtualProtect(hookSite, 5, PAGE_EXECUTE_READWRITE, &old)) {
-            Log("VirtualProtect FAIL err=%lu", GetLastError());
+            Log("VirtualProtect RC FAIL err=%lu", GetLastError());
             VirtualFree(stub, 0, MEM_RELEASE);
             return false;
         }
@@ -1677,8 +1678,8 @@ static bool InstallNetworkHook()
         g_netHook.pSite     = hookSite;
         g_netHook.pStub     = stub;
         g_netHook.installed = true;
-        g_netHook.kind      = NET_HOOK_OLD;
-        Log("Hook reseau (ancien) OK : site=%p stub=%p", hookSite, stub);
+        g_netHook.kind      = NET_HOOK_RC;
+        Log("Hook reseau RC OK : site=%p stub=%p", hookSite, stub);
         return true;
     }
 
@@ -1826,62 +1827,61 @@ static bool InstallNetworkHook()
         return true;
     }
 
-    // --- Tentative 4 : RappelzClassic (~10.1 MB) ---
-    patAddr = ScanPattern(NET_HOOK_PATTERN_RC, sizeof(NET_HOOK_PATTERN_RC));
+    // --- Tentative 4 : ancien client (SFrame.exe 17-elem, fallback) ---
+    patAddr = ScanPattern(NET_HOOK_PATTERN, sizeof(NET_HOOK_PATTERN));
     if (patAddr)
     {
-        BYTE* hookSite = (BYTE*)patAddr + NET_HOOK_OFFSET_RC;
-        Log("Pattern RC @ %p, hookSite @ %p", patAddr, hookSite);
+        BYTE* hookSite = (BYTE*)patAddr + NET_HOOK_OFFSET;
+        Log("Pattern ancien client @ %p, hookSite @ %p", patAddr, hookSite);
 
         BYTE* stub = (BYTE*)VirtualAlloc(nullptr, 128,
                          MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-        if (!stub) { Log("VirtualAlloc stub RC FAIL err=%lu", GetLastError()); return false; }
+        if (!stub) { Log("VirtualAlloc stub FAIL err=%lu", GetLastError()); return false; }
 
         // --------------------------------------------------------
-        // Stub RC (RappelzClassic 10.1 MB)
-        // Entree via JMP : edi = TS_MESSAGE* (packet complet, valide)
-        // Meme principe que V7 : on appelle V7PacketCallback(edi)
-        // Bytes voles (6) : 0F B7 4F 04 (movzx ecx,[edi+4]) + 8B C1 (mov eax,ecx)
-        // JMP retour -> hookSite+6 (saute l'orphan byte 0xC1 a hookSite+5)
+        // Stub ancien client
+        // Entree via JMP : ecx=buf, [esp+0]=size, esi=disp, edx=OnRecv
         // --------------------------------------------------------
         BYTE* s = stub;
 
-        *s++ = 0x50; // push eax
-        *s++ = 0x51; // push ecx
-        *s++ = 0x52; // push edx
-        *s++ = 0x56; // push esi
+        *s++ = 0x50;  // push eax
+        *s++ = 0x51;  // push ecx  (buf_ptr)
+        *s++ = 0x52;  // push edx  (OnRecv fn)
+        *s++ = 0x56;  // push esi  (dispatcher)
+        // [esp]=esi [esp+4]=edx [esp+8]=buf [esp+12]=eax [esp+16]=size
 
-        *s++ = 0x57; // push edi   <- arg : TS_MESSAGE*
-        {
-            DWORD ct = (DWORD)(uintptr_t)V7PacketCallback;
-            DWORD cf = (DWORD)(uintptr_t)(s + 5);
-            *s++ = 0xE8;
-            *(DWORD*)s = ct - cf;
-            s += 4;
-        }
-        *s++ = 0x83; *s++ = 0xC4; *s++ = 0x04; // add esp,4
+        *s++ = 0xFF; *s++ = 0x74; *s++ = 0x24; *s++ = 0x10; // push size [esp+16]
+        *s++ = 0xFF; *s++ = 0x74; *s++ = 0x24; *s++ = 0x0C; // push buf  [esp+12]
 
+        DWORD callTarget = (DWORD)(uintptr_t)ProcessDecryptedBuffer;
+        DWORD callFrom   = (DWORD)(uintptr_t)(s + 5);
+        *s++ = 0xE8;
+        *(DWORD*)s = callTarget - callFrom;
+        s += 4;
+
+        *s++ = 0x83; *s++ = 0xC4; *s++ = 0x08; // add esp,8
         *s++ = 0x5E; // pop esi
         *s++ = 0x5A; // pop edx
         *s++ = 0x59; // pop ecx
         *s++ = 0x58; // pop eax
 
-        // Bytes voles (instructions completes) :
-        *s++ = 0x0F; *s++ = 0xB7; *s++ = 0x4F; *s++ = 0x04; // movzx ecx,[edi+4]
-        *s++ = 0x8B; *s++ = 0xC1;                             // mov eax,ecx
+        // Bytes voles : 51 8B CE FF D2
+        *s++ = 0x51;               // push ecx
+        *s++ = 0x8B; *s++ = 0xCE; // mov ecx, esi
+        *s++ = 0xFF; *s++ = 0xD2; // call edx
 
-        // JMP vers hookSite+6 (saute l'orphan byte a hookSite+5)
-        BYTE* jmpBack = hookSite + 6;
+        // JMP vers hookSite+5
+        BYTE* jmpBack = hookSite + 5;
         DWORD jmpRel  = (DWORD)(uintptr_t)jmpBack - (DWORD)(uintptr_t)(s + 5);
         *s++ = 0xE9;
         *(DWORD*)s = jmpRel;
         s += 4;
 
-        Log("Stub RC %d bytes @ %p", (int)(s - stub), stub);
+        Log("Stub ancien %d bytes @ %p", (int)(s - stub), stub);
 
         DWORD old = 0;
         if (!VirtualProtect(hookSite, 5, PAGE_EXECUTE_READWRITE, &old)) {
-            Log("VirtualProtect RC FAIL err=%lu", GetLastError());
+            Log("VirtualProtect FAIL err=%lu", GetLastError());
             VirtualFree(stub, 0, MEM_RELEASE);
             return false;
         }
@@ -1894,8 +1894,8 @@ static bool InstallNetworkHook()
         g_netHook.pSite     = hookSite;
         g_netHook.pStub     = stub;
         g_netHook.installed = true;
-        g_netHook.kind      = NET_HOOK_RC;
-        Log("Hook reseau RC OK : site=%p stub=%p", hookSite, stub);
+        g_netHook.kind      = NET_HOOK_OLD;
+        Log("Hook reseau (ancien) OK : site=%p stub=%p", hookSite, stub);
         return true;
     }
 
