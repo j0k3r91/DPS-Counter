@@ -136,3 +136,30 @@ Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/).
 - Debug : activation de `DPS_DEBUG` pour les dumps hexa des paquets bruts.
 - Correction des offsets dans `DispatchPacket` (debug log `RAWSKILL`) pour le
   nouveau format client.
+
+---
+
+## [1.1.5-RappelzClassic] — 2026-06-28
+
+### Ajouté
+
+- **Support client RappelzClassic (~10.1 MB)** : nouveau pattern réseau
+  `NET_HOOK_PATTERN_RC` (12 octets, sans offsets relatifs) hookant le dispatch
+  principal à `movzx ecx,[edi+04]`. Pattern unique dans le module, testé en
+  première position pour éviter les faux positifs.
+- **Détection auto du layout TS_SC_SKILL** : le flag `g_clientShiftedSkill`
+  est activé pour les patterns RC et 63 (skill_id 3 octets, sans skill_level).
+
+### Corrections
+
+- **Nombre d'élémentaux** : le client RappelzClassic utilise 7 élémentaux
+  (dmgSz=32), comme V7, et non 17. Le calcul `SkillResultSize` était incorrect
+  et empêchait le parsing des SR entries (52 > 45 bytes disponibles).
+- **Faux positif pattern OLD** : le pattern ancien client matchait dans du heap
+  hors module SFrame.exe. Réordonnancement des tentatives : RC d'abord, OLD en
+  dernier (fallback).
+- **Stub RC JMP return** : correction du retour stub à hookSite+6 (au lieu de +4)
+  pour éviter d'exécuter les bytes de l'offset JMP comme code.
+- **Détection handle local** : le parsing skill utilisait un mauvais offset caster,
+  initialisant `g_localHandle` avec une valeur incorrecte et empêchant la
+  détection du joueur local.
