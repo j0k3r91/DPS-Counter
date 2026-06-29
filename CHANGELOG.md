@@ -5,7 +5,7 @@ Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/).
 
 ---
 
-## [1.2.0-RappelzClassic] — 2026-06-29
+## [1.1.6-RappelzClassic] — 2026-06-29
 
 ### Ajouté
 - **Timeout configurable** : réglable de 1s à 120s via le bouton `+` et le mini-panneau (±1s)
