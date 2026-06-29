@@ -462,37 +462,80 @@ static void GetEntityName(unsigned int h, char* out, int outLen)
 // Verifiees sur 2 sessions (base variable, RVA fixe) :
 //   RVA 0x855168 = buffer char nom (max 16 chars)     [VALIDE uniquement sur client 17-elem]
 //   RVA 0x8452F4 = uint32 handle du joueur local      [non fiable dans les deux versions]
-static const unsigned int LOCAL_NAME_RVA   = 0x00855168;
-static const unsigned int LOCAL_HANDLE_RVA = 0x008452F4;
-static const int          LOCAL_NAME_LEN   = 16;
+//   RVA 0x8932BC = buffer char nom V7 (client 7-elem) [VALIDE sur V7 ~8.9 MB]
+static const unsigned int LOCAL_NAME_RVA    = 0x00855168;
+static const unsigned int LOCAL_HANDLE_RVA  = 0x008452F4;
+static const unsigned int LOCAL_NAME_RVA_V7 = 0x008932BC;
+static const int          LOCAL_NAME_LEN    = 16;
+
+// Filtre anti-faux-positifs : rejette les chaines internes du jeu
+static bool IsValidPlayerName(const char* s, int len)
+{
+    if (!s || len < 2 || len > 20) return false;
+    // Doit commencer par une majuscule
+    if (s[0] < 'A' || s[0] > 'Z') return false;
+    // Ne doit contenir que des caracteres valides
+    for (int i = 0; i < len; ++i) {
+        char c = s[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-'))
+            return false;
+    }
+    // Blacklist : prefixes internes du jeu
+    if (len >= 5) {
+        if (strncmp(s, "state_", 6) == 0) return false;
+        if (strncmp(s, "set_",   4) == 0) return false;
+        if (strncmp(s, "monster", 7) == 0) return false;
+        if (strncmp(s, "skill_", 6) == 0) return false;
+        if (strncmp(s, "effect_",7) == 0) return false;
+        if (strncmp(s, "item_",  5) == 0) return false;
+        if (strncmp(s, "npc_",   4) == 0) return false;
+    }
+    // Rejette les noms qui sont en majuscules pures (souvent des constantes internes)
+    bool hasLower = false;
+    for (int i = 0; i < len; ++i) if (s[i] >= 'a' && s[i] <= 'z') { hasLower = true; break; }
+    if (!hasLower && len > 3) return false;
+    return true;
+}
 
 static void ReadLocalPlayerFromMemory()
 {
-    // LOCAL_NAME_RVA et LOCAL_HANDLE_RVA sont valides uniquement sur l'ancien client (17 elem).
-    // Sur le nouveau client (7 elem), ces RVAs ne sont pas connues : on laisse ParseEnter
-    // et ScanLocalHandleThread detecter le nom et le handle du joueur.
-    if (g_clientV7) return;
     HMODULE hSFrame = GetModuleHandleA("SFrame.exe");
     if (!hSFrame) return;
     ULONG_PTR base = (ULONG_PTR)hSFrame;
 
-    // Lire le handle
-    unsigned int h = *(volatile unsigned int*)(base + LOCAL_HANDLE_RVA);
-    // Valider : doit etre de type joueur (bit31 set) et non-nul
-    if ((h & 0x80000000) == 0) h = 0;
+    unsigned int h = 0;
+    const char* pName = nullptr;
+    unsigned int nameRVA = 0;
 
-    // Lire le nom
-    const char* pName = (const char*)(base + LOCAL_NAME_RVA);
+    if (g_clientV7) {
+        // V7 : lire le nom a l'adresse statique connue
+        nameRVA = LOCAL_NAME_RVA_V7;
+        pName = (const char*)(base + nameRVA);
+        // Le handle n'est pas fiable en statique sur V7 ; ParseEnter completera
+    } else {
+        nameRVA = LOCAL_NAME_RVA;
+        pName = (const char*)(base + nameRVA);
+        h = *(volatile unsigned int*)(base + LOCAL_HANDLE_RVA);
+        if ((h & 0x80000000) == 0) h = 0;
+    }
+
     int len = 0;
-    while (len < LOCAL_NAME_LEN && pName[len] >= 0x20 && pName[len] < 0x7F) len++;
+    __try {
+        while (len < LOCAL_NAME_LEN && pName[len] >= 0x20 && pName[len] < 0x7F) len++;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { len = 0; }
 
-    if (len > 0)
+    if (len > 0 && IsValidPlayerName(pName, len))
+    {
         _snprintf_s(g_localNameCache, sizeof(g_localNameCache), _TRUNCATE, "%.*s", len, pName);
+        Log("ReadLocalPlayerMemory: V7=%d RVA=0x%X name=[%s]", (int)g_clientV7, nameRVA, g_localNameCache);
+    }
+    else
+        Log("ReadLocalPlayerMemory: V7=%d RVA=0x%X len=%d invalid", (int)g_clientV7, nameRVA, len);
 
-    if (h && len > 0)
+    if (h && g_localNameCache[0])
     {
         g_localHandle = h;
-        // Pre-enregistrer dans g_entities pour que IsPlayerEntity() retourne true
         EntCS_Enter();
         EntityInfo* e = AllocEntity(h);
         if (e && !e->name[0])
@@ -500,7 +543,7 @@ static void ReadLocalPlayerFromMemory()
         EntCS_Leave();
         Log("LocalPlayer: handle=%u name=[%s]", h, g_localNameCache);
     }
-    else
+    else if (!h)
         Log("LocalPlayer: handle read failed (h=%u len=%d)", h, len);
 }
 
@@ -540,7 +583,7 @@ static DWORD          g_lastHit     = 0;  // max des trois — pour timeout glob
 static DWORD          g_lastDmgOut  = 0;  // dernier evenement TAB_DPS
 static DWORD          g_lastHeal    = 0;  // dernier evenement TAB_HEAL
 static DWORD          g_lastDmgIn   = 0;  // dernier evenement TAB_RCVD
-static const DWORD    FIGHT_TIMEOUT = 5000;
+static DWORD          g_fightTimeout = 20000;  // charge depuis INI
 
 static CRITICAL_SECTION g_statsCS;
 static void StatsCS_Init()  { InitializeCriticalSection(&g_statsCS); }
@@ -661,7 +704,7 @@ static void RecordDamageIn(unsigned int tgt, int dmg)
 static void CheckFightTimeout()
 {
     if (g_fightStart == 0 || g_fightEnd != 0) return;
-    if (GetTickCount() - g_lastHit > FIGHT_TIMEOUT) g_fightEnd = GetTickCount();
+    if (GetTickCount() - g_lastHit > g_fightTimeout) g_fightEnd = GetTickCount();
 }
 
 // ============================================================
@@ -704,6 +747,8 @@ static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg)
         if (!cand || len < 2 || len > 20) return;
         char tmp[24] = {};
         memcpy(tmp, cand, len);
+        // Filtre anti-faux-positifs
+        if (!IsValidPlayerName(tmp, len)) return;
         bool found = false;
         for (int k = 0; k < nCands; ++k)
             if (strcmp(cands[k].name, tmp) == 0) { cands[k].count++; found = true; break; }
@@ -853,6 +898,7 @@ static DWORD WINAPI ScanNameByHandleThread(LPVOID pArg)
                             if (!(b[d] >= 'A' && b[d] <= 'Z')) { d += len+1; continue; }
                             char cand[24] = {};
                             memcpy(cand, b+d, len);
+                            if (!IsValidPlayerName(cand, len)) { d += len+1; continue; }
                             bool found = false;
                             for (int k=0;k<nCands;++k)
                                 if (strcmp(cands[k].name,cand)==0){ cands[k].count++; found=true; break; }
@@ -2075,18 +2121,31 @@ static WNDPROC g_origProc = nullptr;
 // ============================================================
 // Panel UI
 // ============================================================
-#define PANEL_W      360
+#define PANEL_MIN_W   280
+#define PANEL_MAX_W   600
 #define PANEL_HEADER  66
 #define ROW_H         20
-#define MAX_ROWS      12
+#define MAX_ROWS      20  // cap absolu
 
+static int  g_panelW = 360;  // charge depuis INI
 static int  g_panelX = -1, g_panelY = -1;
+static int  g_maxVisibleRows = 12;  // charge depuis INI, ajustable par resize bas
 static bool g_panelVisible = true;
 static bool g_dragging = false, g_dragMoved = false;
 static int  g_dragOffX = 0, g_dragOffY = 0;
-static bool g_closeHover = false, g_resetHover = false;
+static bool g_closeHover = false, g_resetHover = false, g_settingsHover = false;
+static bool g_settingsOpen = false;
+static bool g_resizing = false, g_resizeMoved = false;
+static int  g_resizeOffX = 0;
+static bool g_resizingH = false;      // resize hauteur (nombre de lignes)
+static int  g_resizeOffY = 0;
+static bool g_resizingCorner = false; // resize coin -> largeur + hauteur
+static int  g_cornerInitW = 0, g_cornerInitRows = 0;
+static int  g_cornerInitX = 0, g_cornerInitY = 0;
 static bool g_tab0Hover = false, g_tab1Hover = false, g_tab2Hover = false, g_tab3Hover = false;
 static int  g_panelH = PANEL_HEADER + 14 + MAX_ROWS * ROW_H + 4;
+static float g_panelScale = 1.0f;      // scale proportionnel largeur -> contenu
+static float g_lastFontScale = 0.0f;   // pour recreation polices si changement
 // g_scrollOffset declare en avant de fichier
 
 // ============================================================
@@ -2104,9 +2163,15 @@ static void LoadPanelPos()
     GetIniPath(ini, sizeof(ini));
     int x = (int)GetPrivateProfileIntA("Panel", "X", -1, ini);
     int y = (int)GetPrivateProfileIntA("Panel", "Y", -1, ini);
+    int w = (int)GetPrivateProfileIntA("Panel", "W", 360, ini);
+    int t = (int)GetPrivateProfileIntA("Panel", "Timeout", 20, ini);
+    int r = (int)GetPrivateProfileIntA("Panel", "Rows", 12, ini);
     if (x >= 0) g_panelX = x;
     if (y >= 0) g_panelY = y;
-    Log("LoadPanelPos: x=%d y=%d (ini=%s)", g_panelX, g_panelY, ini);
+    if (w >= PANEL_MIN_W && w <= PANEL_MAX_W) g_panelW = w;
+    if (t >= 1 && t <= 120) g_fightTimeout = (DWORD)t * 1000;
+    if (r >= 4 && r <= MAX_ROWS) g_maxVisibleRows = r;
+    Log("LoadPanelPos: x=%d y=%d w=%d timeout=%ds rows=%d (ini=%s)", g_panelX, g_panelY, g_panelW, (int)(g_fightTimeout/1000), g_maxVisibleRows, ini);
 }
 static void SavePanelPos()
 {
@@ -2116,11 +2181,27 @@ static void SavePanelPos()
     WritePrivateProfileStringA("Panel", "X", buf, ini);
     _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%d", g_panelY);
     WritePrivateProfileStringA("Panel", "Y", buf, ini);
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%d", g_panelW);
+    WritePrivateProfileStringA("Panel", "W", buf, ini);
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%d", (int)(g_fightTimeout / 1000));
+    WritePrivateProfileStringA("Panel", "Timeout", buf, ini);
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%d", g_maxVisibleRows);
+    WritePrivateProfileStringA("Panel", "Rows", buf, ini);
 }
 
 static void EnsurePanelPos() {
     if (g_panelX < 0) g_panelX = 10;
     if (g_panelY < 0) g_panelY = 10;
+    // Taille initiale responsive : ~25% de la largeur ecran (une seule fois)
+    static bool s_firstSize = true;
+    if (s_firstSize && g_vpW > 0) {
+        s_firstSize = false;
+        int autoW = g_vpW / 4;
+        if (autoW < PANEL_MIN_W) autoW = PANEL_MIN_W;
+        if (autoW > PANEL_MAX_W) autoW = PANEL_MAX_W;
+        // Ne pas ecraser une valeur INI explicite (sauf si c'est le defaut 360)
+        if (g_panelW == 360 && autoW != 360) g_panelW = autoW;
+    }
 }
 
 // ============================================================
@@ -2133,11 +2214,16 @@ static void ReleaseFonts() {
     if (g_fontSmall) { g_fontSmall->Release(); g_fontSmall = nullptr; }
 }
 static void EnsureFonts(IDirect3DDevice9* dev) {
+    // Recreer les polices si l'echelle a change
+    if (g_lastFontScale != g_panelScale) {
+        ReleaseFonts();
+        g_lastFontScale = g_panelScale;
+    }
     if (!g_fontRow)
-        D3DXCreateFontA(dev,14,0,FW_BOLD,1,FALSE,DEFAULT_CHARSET,
+        D3DXCreateFontA(dev,(int)(14*g_panelScale+0.5f),0,FW_BOLD,1,FALSE,DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_DONTCARE,"Tahoma",&g_fontRow);
     if (!g_fontSmall)
-        D3DXCreateFontA(dev,11,0,FW_NORMAL,1,FALSE,DEFAULT_CHARSET,
+        D3DXCreateFontA(dev,(int)(11*g_panelScale+0.5f),0,FW_NORMAL,1,FALSE,DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_DONTCARE,"Tahoma",&g_fontSmall);
 }
 static void FillRect2D(IDirect3DDevice9* dev, int x, int y, int w, int h, DWORD col) {
@@ -2227,6 +2313,11 @@ static void DrawDPSPanel(IDirect3DDevice9* dev)
     dev->SetTextureStageState(0,D3DTSS_ALPHAARG1,D3DTA_DIFFUSE);
     dev->SetTextureStageState(1,D3DTSS_COLOROP,  D3DTOP_DISABLE);
     dev->SetTextureStageState(1,D3DTSS_ALPHAOP,  D3DTOP_DISABLE);
+
+    // Echelle proportionnelle : contenu suit la largeur (base 360px = 1.0)
+    g_panelScale = (float)g_panelW / 360.0f;
+    if (g_panelScale < 0.7f) g_panelScale = 0.7f;
+    if (g_panelScale > 1.5f) g_panelScale = 1.5f;
 
     EnsureFonts(dev);
     EnsurePanelPos();
@@ -2322,7 +2413,7 @@ static void DrawDPSPanel(IDirect3DDevice9* dev)
                        (g_tab == TAB_RCVD) ? lastDmgIn : lastDmgOut;
     // Onglet actif = fight en cours ET cet onglet a eu une activite recente
     bool  tabIsActive = fightStart && !fightEnd && tabLastHit &&
-                        (now - tabLastHit <= FIGHT_TIMEOUT);
+                        (now - tabLastHit <= g_fightTimeout);
     // Timer d'affichage : defileait tant qu'actif, gele sur tabLastHit sinon
     DWORD timerEnd  = tabIsActive ? now : (tabLastHit ? tabLastHit : fightStart);
     DWORD timerMs   = (fightStart && timerEnd >= fightStart) ? (timerEnd - fightStart) : 0;
@@ -2353,7 +2444,7 @@ static void DrawDPSPanel(IDirect3DDevice9* dev)
         s_lastPanelDump = now;
         Log("=PANEL= localH=%u localName=[%s] combatants=%d rows=%d dur=%.1fs",
             g_localHandle, g_localNameCache, count, rowCount, durationSec);
-        for (int ri = 0; ri < rowCount && ri < MAX_ROWS; ++ri)
+        for (int ri = 0; ri < rowCount && ri < g_maxVisibleRows; ++ri)
             Log("  [%d] owner=%u name=[%s] val=%lld pet=%d player=%d",
                 ri, rows[ri].ownerHandle, rows[ri].name, rows[ri].value,
                 (int)rows[ri].isPet, (int)IsPlayerEntity(rows[ri].ownerHandle));
@@ -2364,10 +2455,22 @@ static void DrawDPSPanel(IDirect3DDevice9* dev)
     if (g_scrollOffset > rowCount - 1) g_scrollOffset = (rowCount > 0) ? rowCount - 1 : 0;
 
     int visRows = 0;
-    for (int i = g_scrollOffset; i < rowCount && visRows < MAX_ROWS; ++i) ++visRows;
-    int panelH = PANEL_HEADER + 14 + visRows*ROW_H + 4;
+    for (int i = g_scrollOffset; i < rowCount && visRows < g_maxVisibleRows; ++i) ++visRows;
+    int settingsH = g_settingsOpen ? 48 : 0;
+    int rowH = (int)(ROW_H * g_panelScale + 0.5f);
+    int panelH = PANEL_HEADER + settingsH + 14 + visRows*rowH + 4;
+    if (panelH < PANEL_HEADER + 30) panelH = PANEL_HEADER + 30;  // hauteur min pour poignee
     g_panelH = panelH;
-    int px=g_panelX, py=g_panelY, pw=PANEL_W;
+    int px=g_panelX, py=g_panelY, pw=g_panelW;
+    int listY = py + PANEL_HEADER + settingsH; // debut zone liste (sous header + settings)
+    // Colonnes responsives (en % de la largeur depuis le bord droit)
+    int colGrpL = px + pw - (int)(pw * 0.12f);  // Grp% : 12%
+    int colGrpR = px + pw - 4;
+    int colTotL = px + pw - (int)(pw * 0.30f);  // Total : 18%
+    int colTotR = colGrpL - 4;
+    int colDpsL = px + pw - (int)(pw * 0.48f);  // DPS/s : 18%
+    int colDpsR = colTotL - 4;
+    int colNameR = colDpsL - 6;                 // Nom : le reste
 
     FillRect2D(dev,px,py,pw,panelH,D3DCOLOR_ARGB(210,15,15,20));
     DWORD border = D3DCOLOR_ARGB(210,60,120,200);
@@ -2395,11 +2498,36 @@ static void DrawDPSPanel(IDirect3DDevice9* dev)
     FillRect2D(dev,rx,ry3,17,18,g_resetHover?D3DCOLOR_ARGB(230,30,130,30):D3DCOLOR_ARGB(200,15,60,15));
     {RECT rr2={rx,ry3,rx+17,ry3+18};DrawText2(g_fontSmall,"R",rr2,DT_CENTER|DT_VCENTER,D3DCOLOR_ARGB(255,150,255,150));}
 
-    // Onglets
+    // Bouton Settings (engrenage)
+    int sx=rx-19, sy2=by2;
+    FillRect2D(dev,sx,sy2,17,18,g_settingsHover||g_settingsOpen?D3DCOLOR_ARGB(230,60,60,140):D3DCOLOR_ARGB(200,30,30,70));
+    {RECT sr={sx,sy2,sx+17,sy2+18};DrawText2(g_fontSmall,"+",sr,DT_CENTER|DT_VCENTER,D3DCOLOR_ARGB(255,200,200,255));}
+
+    // Panneau settings
+    if(g_settingsOpen){
+        int setY=py+PANEL_HEADER+4, setH=44;
+        FillRect2D(dev,px+1,setY,pw-2,setH,D3DCOLOR_ARGB(225,18,20,35));
+        FillRect2D(dev,px+1,setY,pw-2,1,D3DCOLOR_ARGB(180,80,100,180));
+        FillRect2D(dev,px+1,setY+setH-1,pw-2,1,D3DCOLOR_ARGB(180,80,100,180));
+        {char tbuf[48]; _snprintf_s(tbuf,sizeof(tbuf),_TRUNCATE,"Timeout reset: %ds",(int)(g_fightTimeout/1000));
+         RECT trs={px+6,setY+2,px+pw-6,setY+20};
+         DrawText2(g_fontSmall,tbuf,trs,DT_CENTER|DT_VCENTER,D3DCOLOR_ARGB(255,200,210,255));}
+        int midX=px+pw/2;
+        // Bouton "-"
+        FillRect2D(dev,midX-60,setY+22,36,16,D3DCOLOR_ARGB(200,80,40,40));
+        {RECT mr={midX-60,setY+22,midX-24,setY+38};DrawText2(g_fontSmall,"-1s",mr,DT_CENTER|DT_VCENTER,D3DCOLOR_ARGB(255,255,180,180));}
+        // Bouton "+"
+        FillRect2D(dev,midX+24,setY+22,36,16,D3DCOLOR_ARGB(200,40,120,40));
+        {RECT prs={midX+24,setY+22,midX+60,setY+38};DrawText2(g_fontSmall,"+1s",prs,DT_CENTER|DT_VCENTER,D3DCOLOR_ARGB(255,180,255,180));}
+    }
+
+    // Onglets (responsifs : ~11% de largeur par onglet)
     static const char* tl[4]={"DPS","HEAL","TANK","Max"};
-    int tabW=42, tabY=py+36;
+    int tabW=(int)(pw*0.11f); if(tabW<32)tabW=32; if(tabW>72)tabW=72;
+    int tabGap=(int)(pw*0.005f); if(tabGap<1)tabGap=1;
+    int tabY=py+36;
     for (int t=0;t<4;++t){
-        int tx=px+1+t*(tabW+2); bool active=(g_tab==(MetricTab)t);
+        int tx=px+1+t*(tabW+tabGap); bool active=(g_tab==(MetricTab)t);
         bool hov=(t==0?g_tab0Hover:t==1?g_tab1Hover:t==2?g_tab2Hover:g_tab3Hover);
         DWORD tbg=active?D3DCOLOR_ARGB(230,40,80,160):hov?D3DCOLOR_ARGB(200,30,60,120):D3DCOLOR_ARGB(180,20,35,70);
         FillRect2D(dev,tx,tabY,tabW,16,tbg);
@@ -2422,111 +2550,130 @@ static void DrawDPSPanel(IDirect3DDevice9* dev)
 
     FillRect2D(dev,px+1,py+PANEL_HEADER-1,pw-2,1,D3DCOLOR_ARGB(120,60,120,200));
     // En-tetes de colonnes
-    FillRect2D(dev,px+1,py+PANEL_HEADER,pw-2,14,D3DCOLOR_ARGB(190,10,14,24));
+    FillRect2D(dev,px+1,listY,pw-2,14,D3DCOLOR_ARGB(190,10,14,24));
     {const char* colLbl=(g_tab==TAB_HEAL)?"HPS/s":(g_tab==TAB_RCVD)?"Tank/s":(g_tab==TAB_MAXHIT)?"Max":"DPS/s";
-     RECT ch={px+pw-174,py+PANEL_HEADER,px+pw-112,py+PANEL_HEADER+14};
+     RECT ch={colDpsL,listY,colDpsR,listY+14};
      DrawText2(g_fontSmall,colLbl,ch,DT_RIGHT|DT_VCENTER,D3DCOLOR_ARGB(140,150,180,220));}
-    {RECT ch={px+pw-110,py+PANEL_HEADER,px+pw-46,py+PANEL_HEADER+14};
+    {RECT ch={colTotL,listY,colTotR,listY+14};
      DrawText2(g_fontSmall,"Total",ch,DT_RIGHT|DT_VCENTER,D3DCOLOR_ARGB(140,150,180,220));}
-    {RECT ch={px+pw-44,py+PANEL_HEADER,px+pw-2,py+PANEL_HEADER+14};
+    {RECT ch={colGrpL,listY,colGrpR,listY+14};
      DrawText2(g_fontSmall,"Grp%",ch,DT_RIGHT|DT_VCENTER,D3DCOLOR_ARGB(140,150,180,220));}
-    FillRect2D(dev,px+1,py+PANEL_HEADER+13,pw-2,1,D3DCOLOR_ARGB(80,60,120,200));
+    FillRect2D(dev,px+1,listY+13,pw-2,1,D3DCOLOR_ARGB(80,60,120,200));
 
     int shown = 0;
-    for (int i = g_scrollOffset; i < rowCount && shown < MAX_ROWS; ++i, ++shown)
+    for (int i = g_scrollOffset; i < rowCount && shown < g_maxVisibleRows; ++i, ++shown)
     {
         SortRow& row = rows[i];
-        int ry4 = py+PANEL_HEADER+14+shown*ROW_H;
+        int ry4 = listY+14+shown*rowH;
         DWORD rbg = row.isPet ? kPetBg[row.colorIdx & 7] : kOwnerBg[row.colorIdx & 7];
-        FillRect2D(dev,px+1,ry4,pw-2,ROW_H,rbg);
+        FillRect2D(dev,px+1,ry4,pw-2,rowH,rbg);
 
         if (!row.isPet) {
             // Barre : relative au top joueur (comparaison visuelle)
             float pctMax=maxVal>0?(float)row.value/(float)maxVal:0.f;
             int bw=(int)(pctMax*(pw-2));
-            if(bw>0) FillRect2D(dev,px+1,ry4,bw,ROW_H,kOwnerBar[row.colorIdx & 7]);
+            if(bw>0) FillRect2D(dev,px+1,ry4,bw,rowH,kOwnerBar[row.colorIdx & 7]);
             // Nom
-            {RECT nr={px+6,ry4,px+pw-176,ry4+ROW_H};
+            {RECT nr={px+6,ry4,colNameR,ry4+rowH};
              DrawText2(g_fontRow,row.name,nr,DT_LEFT|DT_VCENTER,D3DCOLOR_ARGB(255,230,230,230));}
             // DPS/val par seconde (ou max hit pour l'onglet Max)
             char dpsStr[32]="--";
             if(g_tab==TAB_MAXHIT){
                 if(row.maxValue>0){
                     if(row.maxValue>=1000000) _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%.2fM",(float)row.maxValue/1000000.f);
-                    else if(row.maxValue>=10000) _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%.0fk",(float)row.maxValue/1000.f);
+                    else if(row.maxValue>=10000) _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%.1fk",(float)row.maxValue/1000.f);
                     else _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%d",row.maxValue);
                 }
             } else if(row.value > 0){
                 float dps=(float)row.value / ((durationSec>1.0f)?durationSec:1.0f);
                 if(dps>=1000000.f) _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%.2fM",dps/1000000.f);
-                else if(dps>=10000.f) _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%.0fk",dps/1000.f);
+                else if(dps>=10000.f) _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%.1fk",dps/1000.f);
                 else if(dps>=1000.f) _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%.1fk",dps/1000.f);
                 else _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%.0f",dps);
             }
-            {RECT dr={px+pw-174,ry4,px+pw-112,ry4+ROW_H};
+            {RECT dr={colDpsL,ry4,colDpsR,ry4+rowH};
              DrawText2(g_fontRow,dpsStr,dr,DT_RIGHT|DT_VCENTER,D3DCOLOR_ARGB(255,255,220,100));}
             // Total
             char totStr[32];
             if(row.value>=1000000LL) _snprintf_s(totStr,sizeof(totStr),_TRUNCATE,"%.2fM",row.value/1000000.0);
-            else if(row.value>=10000LL) _snprintf_s(totStr,sizeof(totStr),_TRUNCATE,"%.0fk",row.value/1000.0);
+            else if(row.value>=10000LL) _snprintf_s(totStr,sizeof(totStr),_TRUNCATE,"%.1fk",row.value/1000.0);
             else if(row.value>=1000LL) _snprintf_s(totStr,sizeof(totStr),_TRUNCATE,"%.1fk",row.value/1000.0);
             else _snprintf_s(totStr,sizeof(totStr),_TRUNCATE,"%lld",row.value);
-            {RECT tr3={px+pw-110,ry4,px+pw-46,ry4+ROW_H};
+            {RECT tr3={colTotL,ry4,colTotR,ry4+rowH};
              DrawText2(g_fontSmall,totStr,tr3,DT_RIGHT|DT_VCENTER,D3DCOLOR_ARGB(220,180,210,255));}
             // Pourcentage du groupe
             char ps[16];
             {int pct=(groupTotal>0)?(int)((row.value*100LL)/groupTotal):0;
              _snprintf_s(ps,sizeof(ps),_TRUNCATE,"%d%%",pct);}
-            {RECT pr={px+pw-44,ry4,px+pw-2,ry4+ROW_H};
+            {RECT pr={colGrpL,ry4,colGrpR,ry4+rowH};
              DrawText2(g_fontSmall,ps,pr,DT_RIGHT|DT_VCENTER,D3DCOLOR_ARGB(220,255,180,80));}
         } else {
             // Ligne pet - indentee
-            {RECT nr={px+18,ry4,px+pw-176,ry4+ROW_H};
+            {RECT nr={px+18,ry4,colNameR,ry4+rowH};
              DrawText2(g_fontSmall,row.name,nr,DT_LEFT|DT_VCENTER,D3DCOLOR_ARGB(210,180,200,140));}
             // DPS pet
             char dpsStr[32]="--";
             if(g_tab==TAB_MAXHIT){
                 if(row.maxValue>0){
-                    if(row.maxValue>=10000) _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%.0fk",(float)row.maxValue/1000.f);
+                    if(row.maxValue>=10000) _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%.1fk",(float)row.maxValue/1000.f);
                     else _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%d",row.maxValue);
                 }
             } else if(row.value > 0){
                 float dps=(float)row.value / ((durationSec>1.0f)?durationSec:1.0f);
                 if(dps>=1000000.f) _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%.2fM",dps/1000000.f);
-                else if(dps>=10000.f) _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%.0fk",dps/1000.f);
+                else if(dps>=10000.f) _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%.1fk",dps/1000.f);
                 else if(dps>=1000.f) _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%.1fk",dps/1000.f);
                 else _snprintf_s(dpsStr,sizeof(dpsStr),_TRUNCATE,"%.0f",dps);
             }
-            {RECT dr={px+pw-174,ry4,px+pw-112,ry4+ROW_H};
+            {RECT dr={colDpsL,ry4,colDpsR,ry4+rowH};
              DrawText2(g_fontSmall,dpsStr,dr,DT_RIGHT|DT_VCENTER,D3DCOLOR_ARGB(200,200,180,80));}
             // Total
             char totStr[32];
             if(row.value>=1000000LL) _snprintf_s(totStr,sizeof(totStr),_TRUNCATE,"%.2fM",row.value/1000000.0);
+            else if(row.value>=10000LL) _snprintf_s(totStr,sizeof(totStr),_TRUNCATE,"%.1fk",row.value/1000.0);
             else if(row.value>=1000LL) _snprintf_s(totStr,sizeof(totStr),_TRUNCATE,"%.0fk",row.value/1000.0);
             else _snprintf_s(totStr,sizeof(totStr),_TRUNCATE,"%lld",row.value);
-            {RECT tr3={px+pw-110,ry4,px+pw-46,ry4+ROW_H};
+            {RECT tr3={colTotL,ry4,colTotR,ry4+rowH};
              DrawText2(g_fontSmall,totStr,tr3,DT_RIGHT|DT_VCENTER,D3DCOLOR_ARGB(180,155,175,115));}
             // Pourcentage du groupe (pet)
             char ps[16];
             {int pct=(groupTotal>0)?(int)((row.value*100LL)/groupTotal):0;
              _snprintf_s(ps,sizeof(ps),_TRUNCATE,"%d%%",pct);}
-            {RECT pr={px+pw-44,ry4,px+pw-2,ry4+ROW_H};
+            {RECT pr={colGrpL,ry4,colGrpR,ry4+rowH};
              DrawText2(g_fontSmall,ps,pr,DT_RIGHT|DT_VCENTER,D3DCOLOR_ARGB(180,210,160,60));}
         }
     }
-    // Barre de defilement verticale (visible seulement si plus de MAX_ROWS entrees)
-    if (rowCount > MAX_ROWS)
+    // Barre de defilement verticale (visible seulement si plus de g_maxVisibleRows entrees)
+    if (rowCount > g_maxVisibleRows)
     {
         int sbX     = px + pw - 5;
-        int sbTrackY = py + PANEL_HEADER + 14;
-        int sbTrackH = visRows * ROW_H;
+        int sbTrackY = listY + 14;
+        int sbTrackH = visRows * rowH;
         FillRect2D(dev, sbX, sbTrackY, 4, sbTrackH, D3DCOLOR_ARGB(100, 40, 40, 50));
-        float thumbFrac   = (float)MAX_ROWS  / (float)rowCount;
+        float thumbFrac   = (float)g_maxVisibleRows  / (float)rowCount;
         float offsetFrac  = (float)g_scrollOffset / (float)rowCount;
         int   thumbH = (int)(sbTrackH * thumbFrac); if (thumbH < 6) thumbH = 6;
         int   thumbY = sbTrackY + (int)(sbTrackH * offsetFrac);
         if (thumbY + thumbH > sbTrackY + sbTrackH) thumbY = sbTrackY + sbTrackH - thumbH;
         FillRect2D(dev, sbX, thumbY, 4, thumbH, D3DCOLOR_ARGB(200, 100, 150, 255));
+    }
+    // Poignees de redimensionnement
+    if(!g_settingsOpen){
+        // Coin bas-droit (largeur + hauteur)
+        int cx=px+pw-16, cy=py+panelH-16;
+        FillRect2D(dev,cx+10,cy+10,6,2,D3DCOLOR_ARGB(180,160,180,220));
+        FillRect2D(dev,cx+8,cy+12,8,2,D3DCOLOR_ARGB(160,140,160,200));
+        FillRect2D(dev,cx+6,cy+14,10,2,D3DCOLOR_ARGB(140,120,140,180));
+        // Bord droit (largeur)
+        int rhx=px+pw-10, rhy=py+panelH-4;
+        FillRect2D(dev,rhx,rhy,8,2,D3DCOLOR_ARGB(100,100,120,140));
+        FillRect2D(dev,rhx+2,rhy-3,6,2,D3DCOLOR_ARGB(100,100,120,140));
+        FillRect2D(dev,rhx+4,rhy-6,4,2,D3DCOLOR_ARGB(100,100,120,140));
+        // Bord bas (hauteur)
+        int bbx=px+pw-4, bby=py+panelH-10;
+        FillRect2D(dev,bbx,bby,2,8,D3DCOLOR_ARGB(100,100,120,140));
+        FillRect2D(dev,bbx-3,bby+2,2,6,D3DCOLOR_ARGB(100,100,120,140));
+        FillRect2D(dev,bbx-6,bby+4,2,4,D3DCOLOR_ARGB(100,100,120,140));
     }
 
     pSB->Apply(); pSB->Release();
@@ -2557,21 +2704,131 @@ static HRESULT WINAPI HookedEndScene(IDirect3DDevice9* dev)
 // ============================================================
 static bool PtInPanelHeader(int mx,int my){
     if(!g_panelVisible)return false;
-    return mx>=g_panelX&&mx<g_panelX+PANEL_W&&my>=g_panelY&&my<g_panelY+PANEL_HEADER;}
-static bool PtInClose(int mx,int my){int bx=g_panelX+PANEL_W-18,by=g_panelY+1;return mx>=bx&&mx<bx+17&&my>=by&&my<by+18;}
-static bool PtInReset(int mx,int my){int bx=g_panelX+PANEL_W-37,by=g_panelY+1;return mx>=bx&&mx<bx+17&&my>=by&&my<by+18;}
-static int PtInTab(int mx,int my){int ty=g_panelY+36;if(my<ty||my>=ty+16)return -1;for(int t=0;t<4;++t){int tx=g_panelX+1+t*44;if(mx>=tx&&mx<tx+42)return t;}return -1;}
+    return mx>=g_panelX&&mx<g_panelX+g_panelW&&my>=g_panelY&&my<g_panelY+PANEL_HEADER;}
+static bool PtInClose(int mx,int my){int bx=g_panelX+g_panelW-18,by=g_panelY+1;return mx>=bx&&mx<bx+17&&my>=by&&my<by+18;}
+static bool PtInReset(int mx,int my){int bx=g_panelX+g_panelW-37,by=g_panelY+1;return mx>=bx&&mx<bx+17&&my>=by&&my<by+18;}
+static bool PtInSettings(int mx,int my){int bx=g_panelX+g_panelW-55,by=g_panelY+1;return mx>=bx&&mx<bx+17&&my>=by&&my<by+18;}
+static bool PtInResizeCorner(int mx,int my){
+    if(!g_panelVisible||g_settingsOpen)return false;
+    // Coin bas-droit : 30x30px -> largeur + hauteur simultanes
+    return (mx >= g_panelX + g_panelW - 30 && mx < g_panelX + g_panelW + 6 &&
+            my >= g_panelY + g_panelH - 30 && my < g_panelY + g_panelH + 6);
+}
+static bool PtInResizeEdge(int mx,int my){
+    if(!g_panelVisible||g_settingsOpen)return false;
+    // Bord droit -> largeur seule (pas le coin)
+    return (mx>=g_panelX+g_panelW-8&&mx<g_panelX+g_panelW+4 &&
+            my>=g_panelY&&my<g_panelY+g_panelH-30);
+}
+static bool PtInResizeBottom(int mx,int my){
+    if(!g_panelVisible||g_settingsOpen)return false;
+    // Bord bas -> hauteur seule (pas le coin)
+    int gripTop = g_panelY + g_panelH - 12;
+    if (gripTop < g_panelY + PANEL_HEADER) gripTop = g_panelY + PANEL_HEADER;
+    return (my >= gripTop && my < g_panelY + g_panelH + 6 &&
+            mx >= g_panelX && mx < g_panelX + g_panelW - 30);
+}
+static int PtInTab(int mx,int my){
+    int ty=g_panelY+36;if(my<ty||my>=ty+16)return -1;
+    int tabW=(int)(g_panelW*0.11f); if(tabW<32)tabW=32; if(tabW>72)tabW=72;
+    int tabGap=(int)(g_panelW*0.005f); if(tabGap<1)tabGap=1;
+    for(int t=0;t<4;++t){int tx=g_panelX+1+t*(tabW+tabGap);if(mx>=tx&&mx<tx+tabW)return t;}return -1;
+}
 static bool HandlePanelMouse(UINT msg,LPARAM lp){
     if(!g_panelVisible||g_vpW<=0)return false;
     int mx=GET_X_LPARAM(lp),my=GET_Y_LPARAM(lp);
-    if(msg==WM_MOUSEMOVE){g_closeHover=PtInClose(mx,my);g_resetHover=PtInReset(mx,my);int t=PtInTab(mx,my);g_tab0Hover=(t==0);g_tab1Hover=(t==1);g_tab2Hover=(t==2);g_tab3Hover=(t==3);}
+
+    // Gestion du panneau settings (prioritaire)
+    if(g_settingsOpen){
+        int sy=g_panelY+PANEL_HEADER+4, sh=44; // hauteur du mini-panneau
+        bool inSettings=mx>=g_panelX&&mx<g_panelX+g_panelW&&my>=sy&&my<sy+sh;
+        if(msg==WM_LBUTTONDOWN){
+            // Boutons +/- timeout
+            int midX=g_panelX+g_panelW/2;
+            if(my>=sy+20&&my<sy+40){
+                if(mx>=midX-60&&mx<midX-20){ // bouton "-"
+                    if(g_fightTimeout>1000) g_fightTimeout-=1000;
+                    SavePanelPos(); return true;
+                }
+                if(mx>=midX+20&&mx<midX+60){ // bouton "+"
+                    if(g_fightTimeout<120000) g_fightTimeout+=1000;
+                    SavePanelPos(); return true;
+                }
+            }
+            // Clic hors settings -> fermer
+            if(!inSettings){g_settingsOpen=false;return true;}
+            return true;
+        }
+        // Bloquer autres interactions quand settings ouvert
+        return (msg==WM_MOUSEMOVE) ? false : inSettings;
+    }
+
+    if(msg==WM_MOUSEMOVE){
+        g_closeHover=PtInClose(mx,my); g_resetHover=PtInReset(mx,my);
+        g_settingsHover=PtInSettings(mx,my);
+        int t=PtInTab(mx,my);g_tab0Hover=(t==0);g_tab1Hover=(t==1);g_tab2Hover=(t==2);g_tab3Hover=(t==3);
+    }
     if(msg==WM_LBUTTONDOWN&&PtInClose(mx,my)){SetCapture(g_hWnd);return true;}
     if(msg==WM_LBUTTONUP&&g_closeHover&&PtInClose(mx,my)){ReleaseCapture();g_panelVisible=false;CloseHandle(CreateThread(nullptr,0,UnloadThread,nullptr,0,nullptr));return true;}
     if(msg==WM_LBUTTONDOWN&&PtInReset(mx,my)){SetCapture(g_hWnd);return true;}
     if(msg==WM_LBUTTONUP&&g_resetHover&&PtInReset(mx,my)){ReleaseCapture();ResetCombat();return true;}
+    if(msg==WM_LBUTTONDOWN&&PtInSettings(mx,my)){g_settingsOpen=!g_settingsOpen;return true;}
     if(msg==WM_LBUTTONDOWN){int t=PtInTab(mx,my);if(t>=0&&t<=3){g_tab=(MetricTab)t;return true;}}
-    if(msg==WM_LBUTTONDOWN&&PtInPanelHeader(mx,my)&&!PtInClose(mx,my)&&!PtInReset(mx,my)){g_dragging=true;g_dragMoved=false;g_dragOffX=mx-g_panelX;g_dragOffY=my-g_panelY;SetCapture(g_hWnd);return true;}
-    if(msg==WM_MOUSEMOVE&&g_dragging){g_panelX=mx-g_dragOffX;g_panelY=my-g_dragOffY;if(g_panelX<0)g_panelX=0;if(g_panelY<0)g_panelY=0;if(g_panelX+PANEL_W>g_vpW)g_panelX=g_vpW-PANEL_W;g_dragMoved=true;return true;}
+    // Redimensionnement largeur (bord droit)
+    if(msg==WM_LBUTTONDOWN&&PtInResizeEdge(mx,my)&&!PtInClose(mx,my)&&!PtInReset(mx,my)&&!PtInSettings(mx,my)&&!PtInResizeCorner(mx,my)&&!PtInResizeBottom(mx,my)){
+        g_resizing=true;g_resizeMoved=false;g_resizeOffX=mx-g_panelW;SetCapture(g_hWnd);return true;
+    }
+    if(msg==WM_MOUSEMOVE&&g_resizing){
+        int nw=mx-g_resizeOffX;
+        if(nw<PANEL_MIN_W)nw=PANEL_MIN_W;if(nw>PANEL_MAX_W)nw=PANEL_MAX_W;
+        if(g_panelX+nw>g_vpW)nw=g_vpW-g_panelX;
+        g_panelW=nw;g_resizeMoved=true;return true;
+    }
+    if(msg==WM_LBUTTONUP&&g_resizing){g_resizing=false;ReleaseCapture();if(g_resizeMoved)SavePanelPos();return g_resizeMoved;}
+    // Redimensionnement hauteur (bord bas)
+    if(msg==WM_LBUTTONDOWN&&PtInResizeBottom(mx,my)&&!PtInClose(mx,my)&&!PtInReset(mx,my)&&!PtInSettings(mx,my)&&!PtInResizeEdge(mx,my)&&!PtInResizeCorner(mx,my)){
+        g_resizingH=true;g_resizeMoved=false;g_resizeOffY=my-g_panelH;SetCapture(g_hWnd);return true;
+    }
+    if(msg==WM_MOUSEMOVE&&g_resizingH){
+        int newH = my - g_resizeOffY;
+        int settingsH2 = g_settingsOpen ? 48 : 0;
+        int rowH2 = (int)(ROW_H * g_panelScale + 0.5f);
+        if (rowH2 < 10) rowH2 = 10;
+        int contentH = newH - PANEL_HEADER - settingsH2 - 14 - 4;
+        int newRows = contentH / rowH2;
+        if(newRows<4)newRows=4; if(newRows>MAX_ROWS)newRows=MAX_ROWS;
+        g_maxVisibleRows=newRows;g_resizeMoved=true;return true;
+    }
+    if(msg==WM_LBUTTONUP&&g_resizingH){g_resizingH=false;ReleaseCapture();if(g_resizeMoved)SavePanelPos();return g_resizeMoved;}
+    // Redimensionnement coin (largeur + hauteur en meme temps)
+    if(msg==WM_LBUTTONDOWN&&PtInResizeCorner(mx,my)&&!PtInClose(mx,my)&&!PtInReset(mx,my)&&!PtInSettings(mx,my)){
+        g_resizingCorner=true;g_resizeMoved=false;
+        g_cornerInitW=g_panelW; g_cornerInitRows=g_maxVisibleRows;
+        g_cornerInitX=mx; g_cornerInitY=my;
+        SetCapture(g_hWnd);return true;
+    }
+    if(msg==WM_MOUSEMOVE&&g_resizingCorner){
+        int dX=mx-g_cornerInitX, dY=my-g_cornerInitY;
+        int nw=g_cornerInitW+dX;
+        if(nw<PANEL_MIN_W)nw=PANEL_MIN_W; if(nw>PANEL_MAX_W)nw=PANEL_MAX_W;
+        if(g_panelX+nw>g_vpW)nw=g_vpW-g_panelX;
+        g_panelW=nw;
+        int settingsH2 = g_settingsOpen ? 48 : 0;
+        int rowH2 = (int)(ROW_H * g_panelScale + 0.5f);
+        if (rowH2 < 10) rowH2 = 10;
+        int panelH2 = PANEL_HEADER + settingsH2 + 14 + g_cornerInitRows*rowH2 + 4;
+        int newH = panelH2 + dY;
+        int contentH = newH - PANEL_HEADER - settingsH2 - 14 - 4;
+        int newRows = contentH / rowH2;
+        if(newRows<4)newRows=4; if(newRows>MAX_ROWS)newRows=MAX_ROWS;
+        g_maxVisibleRows=newRows;
+        g_resizeMoved=true;return true;
+    }
+    if(msg==WM_LBUTTONUP&&g_resizingCorner){g_resizingCorner=false;ReleaseCapture();if(g_resizeMoved)SavePanelPos();return g_resizeMoved;}
+    // Drag panel
+    if(msg==WM_LBUTTONDOWN&&PtInPanelHeader(mx,my)&&!PtInClose(mx,my)&&!PtInReset(mx,my)&&!PtInSettings(mx,my)&&!PtInResizeEdge(mx,my)&&!PtInResizeBottom(mx,my)&&!PtInResizeCorner(mx,my)){
+        g_dragging=true;g_dragMoved=false;g_dragOffX=mx-g_panelX;g_dragOffY=my-g_panelY;SetCapture(g_hWnd);return true;}
+    if(msg==WM_MOUSEMOVE&&g_dragging){g_panelX=mx-g_dragOffX;g_panelY=my-g_dragOffY;if(g_panelX<0)g_panelX=0;if(g_panelY<0)g_panelY=0;if(g_panelX+g_panelW>g_vpW)g_panelX=g_vpW-g_panelW;g_dragMoved=true;return true;}
     if(msg==WM_LBUTTONUP&&g_dragging){g_dragging=false;ReleaseCapture();if(g_dragMoved)SavePanelPos();return g_dragMoved;}
     return false;
 }
@@ -2588,7 +2845,7 @@ static LRESULT CALLBACK CustomWndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
 
         // Convertir ensuite en client pour test hitbox panneau.
         ScreenToClient(hwnd,&pt);
-        if(pt.x>=g_panelX&&pt.x<g_panelX+PANEL_W&&pt.y>=g_panelY&&pt.y<g_panelY+g_panelH)
+        if(pt.x>=g_panelX&&pt.x<g_panelX+g_panelW&&pt.y>=g_panelY&&pt.y<g_panelY+g_panelH)
         {   int delta=GET_WHEEL_DELTA_WPARAM(wp);
             if(delta>0&&g_scrollOffset>0) --g_scrollOffset;
             else if(delta<0) ++g_scrollOffset;

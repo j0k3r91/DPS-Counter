@@ -5,6 +5,28 @@ Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/).
 
 ---
 
+## [1.2.0-RappelzClassic] — 2026-06-29
+
+### Ajouté
+- **Timeout configurable** : réglable de 1s à 120s via le bouton `+` et le mini-panneau (±1s)
+- **Redimensionnement responsive** : bord droit (largeur), bord bas (hauteur/lignes), coin (les deux)
+- **Polices et lignes proportionnelles** : le contenu scale automatiquement avec la largeur
+- **Colonnes en pourcentages** : DPS/s 18%, Total 18%, Grp% 12% — plus de pixels en dur
+- **Onglets responsifs** : taille adaptative (~11% de la largeur)
+- **Poignées visuelles** de redimensionnement (coin, bord droit, bord bas)
+- **Taille initiale adaptative** : ~25% de la largeur écran au premier lancement
+- **Sauvegarde INI** : largeur (W), timeout, nombre de lignes (Rows)
+
+### Corrigé
+- **Nom du joueur local sur V7** : adresse statique `SFrame.exe + 0x8932BC`
+- **Filtre anti-faux-positifs** (`IsValidPlayerName`) : rejette `state_*`, `set_*`, `monster*`, etc.
+- **Timeout minimum** abaissé de 3s → 1s
+- **Virgule de précision** pour les valeurs >10k (18.2k au lieu de 18k)
+- **Hauteur minimale** du panneau (96px) pour toujours pouvoir saisir le bord bas
+- **Zone de saisie élargie** : 12px au bord bas, 30x30px dans le coin
+
+---
+
 ## [1.0.0] — 2026-05-25
 
 ### Ajouté
